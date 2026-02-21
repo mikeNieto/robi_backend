@@ -1,0 +1,73 @@
+# nginx/nginx.conf.template — Reverse proxy HTTPS para Robi Backend
+#
+# Este archivo es un TEMPLATE. nginx:alpine lo procesa al arrancar y sustituye
+# las variables ${VAR} con los valores del entorno del contenedor.
+#
+# Variables requeridas (pasadas desde docker-compose):
+#   SERVER_IP  — IP o hostname del servidor (viene de .env)
+#
+# Puerto externo : 9393  (HTTPS)
+# Puerto interno : 8000  (FastAPI en el contenedor "robi-backend")
+#
+# Soporta:
+#   • TLS con certificado autofirmado (cert pinning en Android)
+#   • Upgrade de WebSocket para /ws/interact
+#   • Cabeceras de proxy para que FastAPI vea la IP real del cliente
+
+upstream fastapi_backend {
+    server robi-backend:8000;
+    keepalive 64;
+}
+
+server {
+    listen 9393 ssl;
+    server_name ${SERVER_IP};
+
+    # ── TLS ──────────────────────────────────────────────────────────────────
+    ssl_certificate     /etc/nginx/certs/server.crt;
+    ssl_certificate_key /etc/nginx/certs/server.key;
+
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # ── Límites de tamaño (audio hasta 50 MB según .env.example) ─────────────
+    client_max_body_size 50m;
+
+    # ── WebSocket: /ws/* ──────────────────────────────────────────────────────
+    location /ws/ {
+        proxy_pass         http://fastapi_backend;
+        proxy_http_version 1.1;
+
+        # Headers obligatorios para el handshake WebSocket
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Timeouts largos para sesiones de voz continuas
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
+        proxy_connect_timeout 10s;
+    }
+
+    # ── REST API y docs ───────────────────────────────────────────────────────
+    location / {
+        proxy_pass         http://fastapi_backend;
+        proxy_http_version 1.1;
+
+        proxy_set_header Connection        "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_read_timeout  60s;
+        proxy_send_timeout  60s;
+        proxy_connect_timeout 10s;
+    }
+}

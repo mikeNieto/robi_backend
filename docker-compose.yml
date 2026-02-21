@@ -1,0 +1,64 @@
+# docker-compose.yml — Robi Backend
+#
+# Servicios:
+#   fastapi  — imagen local construida desde el Dockerfile
+#   nginx    — reverse proxy HTTPS (nginx:alpine)
+#
+# Uso:
+#   bash scripts/generate_certs.sh   # solo la primera vez
+#   docker compose up -d --build
+#   docker compose logs -f
+
+services:
+
+  # ── FastAPI ────────────────────────────────────────────────────────────────
+  robi-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Forzar entorno producción dentro del contenedor
+      ENVIRONMENT: production
+      HOST: 0.0.0.0
+      PORT: "8000"
+    volumes:
+      # Persistir base de datos SQLite y archivos de media entre reinicios
+      - ./data:/app/data
+      - ./media:/app/media
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "uv",
+          "run",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── Nginx ──────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "9393:9393"
+    environment:
+      # Pasada al entrypoint de nginx:alpine para sustituir ${SERVER_IP} en
+      # el template — lee el valor definido en .env mediante docker compose.
+      SERVER_IP: ${SERVER_IP:-192.168.2.200}
+    volumes:
+      # nginx:alpine ejecuta envsubst sobre *.template en /etc/nginx/templates/
+      # y escribe el resultado en /etc/nginx/conf.d/ al arrancar.
+      - ./nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      robi-backend:
+        condition: service_healthy
