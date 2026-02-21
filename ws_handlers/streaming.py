@@ -23,6 +23,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
@@ -54,8 +55,13 @@ logger = logging.getLogger(__name__)
 # [emotion:TAG][emojis:CODE,...][actions:step|...][media_summary: ...]
 _MAX_HEADER_BUFFER = 500
 
-# Tamaño máximo del buffer para detectar el [media_summary: ...] tag
-_MAX_SUMMARY_BUFFER = 300
+# Regex para eliminar/extraer el tag [media_summary: ...] de texto producido por el LLM
+_MEDIA_SUMMARY_RE = re.compile(
+    r"\[media_summary:\s*.*?\]",
+    re.DOTALL | re.IGNORECASE,
+)
+# String literal de apertura del tag (para búsqueda rápida case-insensitive en pending_buf)
+_MEDIA_SUMMARY_OPEN = "[media_summary:"
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -196,11 +202,13 @@ async def ws_interact(websocket: WebSocket) -> None:
                         image_bytes = base64.b64decode(raw_b64)
                     except Exception:
                         image_bytes = None
+                # Texto opcional enviado junto a la imagen (multimodal texto+imagen)
+                inline_text: str | None = msg.get("text") or None
                 await _process_interaction(
                     websocket=websocket,
                     user_id=user_id,
                     request_id=request_id,
-                    user_input=None,
+                    user_input=inline_text,
                     input_type="vision",
                     image_data=image_bytes,
                     history_service=history_service,
@@ -221,13 +229,61 @@ async def ws_interact(websocket: WebSocket) -> None:
                         video_bytes = base64.b64decode(raw_b64)
                     except Exception:
                         video_bytes = None
+                # Texto opcional enviado junto al video (multimodal texto+video)
+                inline_text_v: str | None = msg.get("text") or None
                 await _process_interaction(
                     websocket=websocket,
                     user_id=user_id,
                     request_id=request_id,
-                    user_input=None,
+                    user_input=inline_text_v,
                     input_type="vision",
                     video_data=video_bytes,
+                    history_service=history_service,
+                    session_id=session_id,
+                    agent=agent,
+                )
+
+            elif client_type == "multimodal":
+                # Mensaje único con cualquier combinación de texto + audio + imagen + video
+                if not request_id:
+                    request_id = msg.get("request_id") or new_session_id()
+                else:
+                    request_id = msg.get("request_id") or request_id
+
+                def _b64_decode(field: str) -> bytes | None:
+                    raw = msg.get(field)
+                    if not raw:
+                        return None
+                    try:
+                        return base64.b64decode(raw)
+                    except Exception:
+                        return None
+
+                mm_text: str | None = msg.get("text") or None
+                mm_audio = _b64_decode("audio")
+                mm_image = _b64_decode("image")
+                mm_video = _b64_decode("video")
+                mm_audio_mime: str = msg.get("audio_mime", "audio/webm")
+                mm_image_mime: str = msg.get("image_mime", "image/jpeg")
+                mm_video_mime: str = msg.get("video_mime", "video/mp4")
+
+                input_type_mm = (
+                    "vision"
+                    if (mm_image or mm_video)
+                    else ("audio" if mm_audio else "text")
+                )
+                await _process_interaction(
+                    websocket=websocket,
+                    user_id=user_id,
+                    request_id=request_id,
+                    user_input=mm_text,
+                    input_type=input_type_mm,
+                    audio_data=mm_audio,
+                    image_data=mm_image,
+                    video_data=mm_video,
+                    audio_mime_type=mm_audio_mime,
+                    image_mime_type=mm_image_mime,
+                    video_mime_type=mm_video_mime,
                     history_service=history_service,
                     session_id=session_id,
                     agent=agent,
@@ -264,8 +320,11 @@ async def _process_interaction(
     session_id: str,
     agent,
     audio_data: bytes | None = None,
+    audio_mime_type: str = "audio/webm",
     image_data: bytes | None = None,
+    image_mime_type: str = "image/jpeg",
     video_data: bytes | None = None,
+    video_mime_type: str = "video/mp4",
 ) -> None:
     """
     Procesa una interacción completa:
@@ -293,6 +352,15 @@ async def _process_interaction(
     if has_media:
         enriched_input: str | None = None
         memory_context = _build_memory_context(memories)
+        # Si el usuario envió texto junto al media (p.ej. "¿qué ves?"),
+        # añadirlo como contexto para que Gemini lo reciba junto a la imagen/audio.
+        if user_input:
+            user_text_part = f"Mensaje del usuario: {user_input}"
+            memory_context = (
+                f"{memory_context}\n\n{user_text_part}".strip()
+                if memory_context
+                else user_text_part
+            )
     else:
         enriched_input = _build_context_input(user_input or "", memories)
         memory_context = ""
@@ -309,13 +377,10 @@ async def _process_interaction(
         dict
     ] = []  # acciones físicas del robot (sugeridas por el LLM)
 
-    # Estado del resumen de media:
-    # Para interacciones de audio/imagen/video el LLM emite [media_summary: ...]
-    # justo después del emotion tag. Lo extraemos y silenciamos (no va a TTS).
-    # summary_done=True para texto → saltamos la fase de resumen.
+    # El LLM emite [media_summary: ...] AL FINAL de su respuesta.
+    # Usamos pending_buf para detectar el tag aunque llegue fragmentado entre chunks.
     media_summary: str = ""
-    summary_done: bool = not has_media
-    summary_buf: str = ""
+    pending_buf: str = ""
 
     try:
         async for chunk in run_agent_stream(
@@ -325,8 +390,11 @@ async def _process_interaction(
             user_id=user_id,
             agent=agent,
             audio_data=audio_data,
+            audio_mime_type=audio_mime_type,
             image_data=image_data,
+            image_mime_type=image_mime_type,
             video_data=video_data,
+            video_mime_type=video_mime_type,
             memory_context=memory_context,
         ):
             if not chunk:
@@ -396,54 +464,49 @@ async def _process_interaction(
                 )
                 emotion_sent = True
 
-                if not summary_done:
-                    # FASE 2 (media): buscar [media_summary: ...] en el texto restante
-                    summary_buf = remaining
-                    s_close = "]" in summary_buf
-                    s_full = len(summary_buf) >= _MAX_SUMMARY_BUFFER
-                    if s_close or s_full:
-                        media_summary, after_summary = _parse_media_summary(summary_buf)
-                        summary_done = True
-                        if not media_summary:
-                            # LLM no emitió el tag → enviar el buffer como texto normal
-                            after_summary = summary_buf
-                        if after_summary:
-                            await _send_safe(
-                                websocket,
-                                make_text_chunk(request_id, after_summary),
-                            )
-                            full_response += after_summary
-                    # else: continuar acumulando en summary_buf en la siguiente fase
-                else:
-                    # FASE 3 directa (texto): enviar el texto restante del prefijo
-                    if remaining:
-                        await _send_safe(
-                            websocket,
-                            make_text_chunk(request_id, remaining),
-                        )
-                        full_response += remaining
-
-            elif not summary_done:
-                # FASE 2 continuada: acumular más chunks hasta completar [media_summary: ...]
-                summary_buf += chunk
-                s_close = "]" in summary_buf
-                s_full = len(summary_buf) >= _MAX_SUMMARY_BUFFER
-                if s_close or s_full:
-                    media_summary, after_summary = _parse_media_summary(summary_buf)
-                    summary_done = True
-                    if not media_summary:
-                        after_summary = summary_buf
-                    if after_summary:
-                        await _send_safe(
-                            websocket,
-                            make_text_chunk(request_id, after_summary),
-                        )
-                        full_response += after_summary
+                # El texto restante del prefijo se enruta al pending_buf para ser
+                # procesado igual que el resto del stream en FASE 3.
+                if remaining:
+                    pending_buf += remaining
 
             else:
-                # FASE 3: streaming normal de text_chunks
-                await _send_safe(websocket, make_text_chunk(request_id, chunk))
-                full_response += chunk
+                # FASE 3: streaming con detección de [media_summary:...] al final.
+                # pending_buf permite manejar el tag aunque llegue fragmentado en chunks.
+                pending_buf += chunk
+                lower_buf = pending_buf.lower()
+                tag_pos = lower_buf.find(_MEDIA_SUMMARY_OPEN)
+                if tag_pos >= 0:
+                    # Encontrado el inicio del tag — flush todo lo anterior al cliente
+                    before = pending_buf[:tag_pos]
+                    if before:
+                        await _send_safe(websocket, make_text_chunk(request_id, before))
+                        full_response += before
+                    pending_buf = pending_buf[tag_pos:]
+                    # ¿Tenemos ya el cierre ]?
+                    close_pos = pending_buf.find("]", len(_MEDIA_SUMMARY_OPEN))
+                    if close_pos >= 0:
+                        media_summary = pending_buf[
+                            len(_MEDIA_SUMMARY_OPEN) : close_pos
+                        ].strip()
+                        after_tag = pending_buf[close_pos + 1 :].lstrip()
+                        pending_buf = ""
+                        if after_tag:
+                            await _send_safe(
+                                websocket, make_text_chunk(request_id, after_tag)
+                            )
+                            full_response += after_tag
+                    # else: tag aún incompleto, seguir acumulando en pending_buf
+                else:
+                    # Sin inicio de tag — flush todo excepto margen de seguridad
+                    margin = len(_MEDIA_SUMMARY_OPEN)
+                    safe_len = max(0, len(pending_buf) - margin)
+                    if safe_len > 0:
+                        to_send = pending_buf[:safe_len]
+                        await _send_safe(
+                            websocket, make_text_chunk(request_id, to_send)
+                        )
+                        full_response += to_send
+                        pending_buf = pending_buf[safe_len:]
 
     except Exception as exc:
         logger.error(
@@ -480,16 +543,25 @@ async def _process_interaction(
         if full_response:
             await _send_safe(websocket, make_text_chunk(request_id, full_response))
 
-    # Si la fase de resumen no terminó (stream muy corto), extraer lo que haya
-    if not summary_done and summary_buf:
-        media_summary, after_summary = _parse_media_summary(summary_buf)
-        summary_done = True  # noqa: F841
-        if not media_summary:
-            after_summary = summary_buf
-        if after_summary:
-            full_response += after_summary
-
-    # 5. Detectar intent → capture_request si aplica
+    # Flush del pending_buf al finalizar el stream — extrae [media_summary:...] si está ahí
+    if pending_buf:
+        match = re.search(
+            r"\[media_summary:\s*(.*?)\]", pending_buf, re.DOTALL | re.IGNORECASE
+        )
+        if match:
+            if not media_summary:
+                media_summary = match.group(1).strip()
+            before_tag = pending_buf[: match.start()].rstrip()
+            after_tag = pending_buf[match.end() :].lstrip()
+            clean = (
+                before_tag + (" " if before_tag and after_tag else "") + after_tag
+            ).strip()
+        else:
+            clean = pending_buf.strip()
+        if clean:
+            await _send_safe(websocket, make_text_chunk(request_id, clean))
+            full_response += clean
+        pending_buf = ""
     intent = classify_intent(full_response)
     if intent == "photo_request":
         await _send_safe(websocket, make_capture_request(request_id, "photo"))
@@ -632,26 +704,6 @@ def _build_context_input(user_input: str, memories: list) -> str:
     memory_lines = [f"- {m.content}" for m in memories]
     memory_block = "\n".join(memory_lines)
     return f"[Contexto del usuario:\n{memory_block}\n]\n\n{user_input}"
-
-
-def _parse_media_summary(text: str) -> tuple[str, str]:
-    """
-    Extrae el tag [media_summary: ...] del inicio del texto.
-    Devuelve (contenido_del_resumen, texto_restante).
-    Si no hay tag al inicio, devuelve ("", text).
-    """
-    import re
-
-    match = re.match(
-        r"^\s*\[media_summary:\s*(.*?)\]",
-        text,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if match:
-        summary = match.group(1).strip()
-        remaining = text[match.end() :].lstrip()
-        return summary, remaining
-    return "", text
 
 
 def _build_memory_context(memories: list) -> str:

@@ -20,9 +20,12 @@ Uso:
 """
 
 import base64
+import logging
 from collections.abc import AsyncIterator
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+logger = logging.getLogger(__name__)
 
 from services.gemini import get_model
 
@@ -79,13 +82,29 @@ Ejemplo: [emotion:greeting][emojis:1F44B,1F600][actions:wave:800|nod:400] ¡Hola
 OMITE esta etiqueta si la respuesta no implica ningún movimiento físico claro.
 
 INSTRUCCIONES PARA AUDIO, VIDEO E IMAGEN (OBLIGATORIO cuando el input sea media):
-Cuando recibas audio, video o imágenes como input, añade INMEDIATAMENTE después de \
-[emojis:...] (o de [actions:...] si lo emites) una etiqueta de resumen:
-[media_summary: descripción breve y clara en máximo 15 palabras de lo que contiene el audio/video/imagen]
-Esta etiqueta es para uso interno del sistema y NO se leerá en voz alta; \
-mejora el historial de conversación.
-Ejemplo completo: [emotion:happy][emojis:1F44B,1F600][media_summary: el usuario saluda y pregunta cómo está Robi] ¡Hola! Estoy muy bien, ¿y tú?
-IMPORTANTE: usa el MISMO idioma del audio/video/imagen para el contenido del media_summary."""
+Cuando recibas audio, video o imágenes, PRIMERO genera tu respuesta conversacional \
+completa con normalidad. AL FINAL de tu respuesta, DESPUÉS del último punto o \
+signo de cierre, añade la etiqueta de resumen detallado:
+
+REGLAS SEGÚN EL TIPO DE MEDIA:
+• VIDEO o IMAGEN: descripción visual MUY DETALLADA y exhaustiva. Incluye sin omitir: \
+encuadre y ángulo, todos los objetos y su posición, personas y sus características \
+visibles, colores, texto legible en pantalla, acciones que ocurren, ambiente, modo \
+claro/oscuro del sistema si es una pantalla, contexto general y cualquier detalle \
+relevante. No hay límite de palabras — sé tan exhaustivo como sea necesario.
+• AUDIO: transcripción LITERAL y COMPLETA de todo lo dicho (cada palabra exacta), \
+seguida de los sonidos de fondo detectados, y finalmente el tono y emoción de la voz \
+(nervioso, alegre, triste, enojado, relajado, seguro, etc.).
+
+Formato de la etiqueta (siempre al final): [media_summary: contenido detallado aquí]
+
+IMPORTANTE:
+- Esta etiqueta va SIEMPRE AL FINAL, después de toda tu respuesta conversacional.
+- NO se leerá en voz alta; es exclusivamente para el historial interno del sistema.
+- Usa el MISMO idioma del audio/video/imagen para el contenido del resumen.
+- Ejemplo de posición correcta: "¡Aquí tienes la información! [...respuesta...] \
+[media_summary: pantalla Windows 11 en modo oscuro; se navega entre carpetas Pictures, \
+Music y Documents; cursor visible, barra de tareas inferior, sin iconos en escritorio]" """
 
 
 # ── Creación del agente ───────────────────────────────────────────────────────
@@ -201,14 +220,78 @@ async def run_agent_stream(
     else:
         messages.append(HumanMessage(content=user_input or ""))
 
+    # ── LOG INPUT ─────────────────────────────────────────────────────────────
+    def _loggable_messages(msgs: list) -> list:
+        """Copia de messages sin los bytes b64 raw (los reemplaza con metadata)."""
+        result = []
+        for m in msgs:
+            role = m.__class__.__name__
+            content = m.content
+            if isinstance(content, list):
+                parts_log = []
+                for part in content:
+                    if isinstance(part, dict):
+                        t = part.get("type", "")
+                        if t == "media":
+                            size = len(base64.b64decode(part.get("data", "")))
+                            parts_log.append(
+                                {
+                                    "type": "media",
+                                    "mime_type": part.get("mime_type"),
+                                    "size_bytes": size,
+                                }
+                            )
+                        elif t == "image_url":
+                            url = part.get("image_url", {}).get("url", "")
+                            # url es "data:<mime>;base64,<data>"
+                            b64_part = url.split(",", 1)[1] if "," in url else ""
+                            size = len(base64.b64decode(b64_part)) if b64_part else 0
+                            mime = url.split(";")[0].replace("data:", "") if url else ""
+                            parts_log.append(
+                                {"type": "image", "mime_type": mime, "size_bytes": size}
+                            )
+                        else:
+                            parts_log.append(part)
+                    else:
+                        parts_log.append(part)
+                result.append({"role": role, "content": parts_log})
+            else:
+                # Para el system prompt recortamos a 300 chars para no saturar
+                preview = (
+                    content
+                    if role != "SystemMessage"
+                    else content[:300] + " ...[system prompt recortado]"
+                )
+                result.append({"role": role, "content": preview})
+        return result
+
+    logger.info(
+        "[AGENT INPUT] session=%s user=%s has_media=%s\n%s",
+        session_id,
+        user_id,
+        has_media,
+        __import__("json").dumps(
+            _loggable_messages(messages), ensure_ascii=False, indent=2
+        ),
+    )
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Intentar stream via agente DeepAgents
+    full_output: list[str] = []
     if agent is not None:
         try:
             yielded = False
             async for chunk in _stream_via_agent(agent, messages, user_input, history):
                 yielded = True
+                full_output.append(chunk)
                 yield chunk
             if yielded:
+                logger.info(
+                    "[AGENT OUTPUT] session=%s user=%s (via deepagents)\n%s",
+                    session_id,
+                    user_id,
+                    "".join(full_output),
+                )
                 return
             # El agente no produjo ningún chunk — caer al modelo directo
         except Exception:
@@ -216,7 +299,14 @@ async def run_agent_stream(
 
     # Fallback: stream directo via modelo LangChain
     async for chunk in _stream_via_model(messages):
+        full_output.append(chunk)
         yield chunk
+    logger.info(
+        "[AGENT OUTPUT] session=%s user=%s (via model directo)\n%s",
+        session_id,
+        user_id,
+        "".join(full_output),
+    )
 
 
 async def _stream_via_agent(

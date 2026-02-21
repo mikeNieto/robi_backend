@@ -8,6 +8,7 @@ Requiere el backend corriendo:
     uv run uvicorn main:app --reload --ws wsproto
 """
 
+import base64
 import json
 import time
 import uuid
@@ -38,7 +39,6 @@ _OPENMOJI_CDN = (
     "https://cdn.jsdelivr.net/gh/hfg-gmuend/openmoji@latest/color/svg/{code}.svg"
 )
 _OPENMOJI_SVG = "https://openmoji.org/data/color/svg/{code}.svg"
-CHUNK_SIZE = 4096
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -124,7 +124,7 @@ def ws_send_and_receive(
     video_bytes: bytes | None,
     user_id: str,
 ) -> dict:
-    """Envía todos los contenidos y recibe la respuesta en streaming."""
+    """Envía todos los contenidos en un único mensaje multimodal y recibe la respuesta."""
     ws = st.session_state.ws
     request_id = str(uuid.uuid4())
     start_ts = time.monotonic()
@@ -135,21 +135,22 @@ def ws_send_and_receive(
         )
     )
 
+    # Construir mensaje multimodal con todas las modalidades disponibles de una vez
+    vid_mode = st.session_state.get("video_mode", "foto")
+    payload: dict = {"type": "multimodal", "request_id": request_id}
     if user_text:
-        ws.send(
-            json.dumps({"type": "text", "content": user_text, "request_id": request_id})
-        )
-
+        payload["text"] = user_text
     if audio_bytes:
-        sent = 0
-        while sent < len(audio_bytes):
-            ws.send(audio_bytes[sent : sent + CHUNK_SIZE])
-            sent += CHUNK_SIZE
-        ws.send(json.dumps({"type": "audio_end", "request_id": request_id}))
-
+        payload["audio"] = base64.b64encode(audio_bytes).decode()
+        payload["audio_mime"] = "audio/webm"
     if video_bytes:
-        ws.send(video_bytes)
-        ws.send(json.dumps({"type": "video_end", "request_id": request_id}))
+        if vid_mode == "foto":
+            payload["image"] = base64.b64encode(video_bytes).decode()
+            payload["image_mime"] = "image/jpeg"
+        else:
+            payload["video"] = base64.b64encode(video_bytes).decode()
+            payload["video_mime"] = "video/mp4"
+    ws.send(json.dumps(payload))
 
     # Recibir — actualizar placeholders en tiempo real mientras llegan los chunks
     emotion = "neutral"
