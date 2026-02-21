@@ -52,6 +52,9 @@ logger = logging.getLogger(__name__)
 # Tamaño máximo del buffer de prefijo para detectar el emotion tag completo
 _MAX_EMOTION_BUFFER = 200
 
+# Tamaño máximo del buffer para detectar el [media_summary: ...] tag
+_MAX_SUMMARY_BUFFER = 300
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -298,6 +301,14 @@ async def _process_interaction(
     emotion_sent = False
     prefix_buf = ""
 
+    # Estado del resumen de media:
+    # Para interacciones de audio/imagen/video el LLM emite [media_summary: ...]
+    # justo después del emotion tag. Lo extraemos y silenciamos (no va a TTS).
+    # summary_done=True para texto → saltamos la fase de resumen.
+    media_summary: str = ""
+    summary_done: bool = not has_media
+    summary_buf: str = ""
+
     try:
         async for chunk in run_agent_stream(
             user_input=enriched_input,
@@ -314,7 +325,7 @@ async def _process_interaction(
                 continue
 
             if not emotion_sent:
-                # Acumular prefijo para detectar el emotion tag completo
+                # FASE 1: acumular prefijo para detectar el emotion tag completo
                 prefix_buf += chunk
                 has_closing_bracket = "]" in prefix_buf
                 buffer_full = len(prefix_buf) >= _MAX_EMOTION_BUFFER
@@ -334,15 +345,54 @@ async def _process_interaction(
                     )
                     emotion_sent = True
 
-                    # Enviar el texto restante del prefijo como primer text_chunk
-                    if remaining:
+                    if not summary_done:
+                        # FASE 2 (media): buscar [media_summary: ...] en el texto restante
+                        summary_buf = remaining
+                        s_close = "]" in summary_buf
+                        s_full = len(summary_buf) >= _MAX_SUMMARY_BUFFER
+                        if s_close or s_full:
+                            media_summary, after_summary = _parse_media_summary(
+                                summary_buf
+                            )
+                            summary_done = True
+                            if not media_summary:
+                                # LLM no emitió el tag → enviar el buffer como texto normal
+                                after_summary = summary_buf
+                            if after_summary:
+                                await _send_safe(
+                                    websocket,
+                                    make_text_chunk(request_id, after_summary),
+                                )
+                                full_response += after_summary
+                        # else: continuar acumulando en summary_buf en la siguiente fase
+                    else:
+                        # FASE 3 directa (texto): enviar el texto restante del prefijo
+                        if remaining:
+                            await _send_safe(
+                                websocket,
+                                make_text_chunk(request_id, remaining),
+                            )
+                            full_response += remaining
+
+            elif not summary_done:
+                # FASE 2 continuada: acumular más chunks hasta completar [media_summary: ...]
+                summary_buf += chunk
+                s_close = "]" in summary_buf
+                s_full = len(summary_buf) >= _MAX_SUMMARY_BUFFER
+                if s_close or s_full:
+                    media_summary, after_summary = _parse_media_summary(summary_buf)
+                    summary_done = True
+                    if not media_summary:
+                        after_summary = summary_buf
+                    if after_summary:
                         await _send_safe(
                             websocket,
-                            make_text_chunk(request_id, remaining),
+                            make_text_chunk(request_id, after_summary),
                         )
-                        full_response += remaining
+                        full_response += after_summary
+
             else:
-                # Streaming normal de text_chunks
+                # FASE 3: streaming normal de text_chunks
                 await _send_safe(websocket, make_text_chunk(request_id, chunk))
                 full_response += chunk
 
@@ -381,6 +431,15 @@ async def _process_interaction(
         if full_response:
             await _send_safe(websocket, make_text_chunk(request_id, full_response))
 
+    # Si la fase de resumen no terminó (stream muy corto), extraer lo que haya
+    if not summary_done and summary_buf:
+        media_summary, after_summary = _parse_media_summary(summary_buf)
+        summary_done = True  # noqa: F841
+        if not media_summary:
+            after_summary = summary_buf
+        if after_summary:
+            full_response += after_summary
+
     # 5. Detectar intent → capture_request si aplica
     intent = classify_intent(full_response)
     if intent == "photo_request":
@@ -408,12 +467,20 @@ async def _process_interaction(
     )
 
     # 8. Background: guardar mensajes en historial + compactar
-    #    Para media: guardamos una etiqueta descriptiva como turno del usuario.
-    history_user_msg = (
-        (user_input or "")
-        if not has_media
-        else ("[audio]" if audio_data is not None else "[imagen/video]")
-    )
+    #    Para media: usamos el resumen extraído del LLM como turno del usuario
+    #    (si el LLM no emitió [media_summary:...] caemos al placeholder genérico).
+    if not has_media:
+        history_user_msg = user_input or ""
+    elif media_summary:
+        history_user_msg = media_summary
+    else:
+        logger.warning(
+            "ws: LLM no emitió [media_summary:] para interacción media "
+            "session_id=%s request_id=%s — usando placeholder",
+            session_id,
+            request_id,
+        )
+        history_user_msg = "[audio]" if audio_data is not None else "[imagen/video]"
     asyncio.create_task(
         _save_history_bg(
             history_service=history_service,
@@ -502,6 +569,26 @@ def _build_context_input(user_input: str, memories: list) -> str:
     memory_lines = [f"- {m.content}" for m in memories]
     memory_block = "\n".join(memory_lines)
     return f"[Contexto del usuario:\n{memory_block}\n]\n\n{user_input}"
+
+
+def _parse_media_summary(text: str) -> tuple[str, str]:
+    """
+    Extrae el tag [media_summary: ...] del inicio del texto.
+    Devuelve (contenido_del_resumen, texto_restante).
+    Si no hay tag al inicio, devuelve ("", text).
+    """
+    import re
+
+    match = re.match(
+        r"^\s*\[media_summary:\s*(.*?)\]",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if match:
+        summary = match.group(1).strip()
+        remaining = text[match.end() :].lstrip()
+        return summary, remaining
+    return "", text
 
 
 def _build_memory_context(memories: list) -> str:

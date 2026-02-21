@@ -31,7 +31,9 @@ from ws_handlers.protocol import (
 )
 from ws_handlers.streaming import (
     _build_context_input,
+    _build_memory_context,
     _load_memories,
+    _parse_media_summary,
     _process_interaction,
     ws_interact,
 )
@@ -289,6 +291,25 @@ class TestStreamingHelpers:
         memories = await _load_memories("user_nonexistent_xyz")
         assert memories == []
 
+    def test_build_memory_context_no_memories(self):
+        result = _build_memory_context([])
+        assert result == ""
+
+    def test_build_memory_context_with_memories(self):
+        from dataclasses import dataclass
+
+        @dataclass
+        class FakeMemory:
+            content: str
+
+        memories = [FakeMemory("Le gusta el té"), FakeMemory("Vive en Madrid")]
+        result = _build_memory_context(memories)
+        assert result.startswith("[Contexto del usuario:")
+        assert "Le gusta el té" in result
+        assert "Vive en Madrid" in result
+        # No debe contener texto de input del usuario (solo el bloque de contexto)
+        assert "\n\n" not in result
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECCIÓN 4 — _process_interaction (streaming + emotion tag)
@@ -453,6 +474,191 @@ class TestProcessInteraction:
         errors = [m for m in sent if m["type"] == "error"]
         assert len(errors) >= 1
         assert errors[0]["error_code"] == "AGENT_ERROR"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECCIÓN 4b — _parse_media_summary
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestParseMediaSummary:
+    def test_basic_extraction(self):
+        """Extrae correctamente el contenido y el texto restante."""
+        summary, remaining = _parse_media_summary(
+            "[media_summary: el usuario dice hola] ¡Hola!"
+        )
+        assert summary == "el usuario dice hola"
+        assert remaining == "¡Hola!"
+
+    def test_no_tag_returns_empty_and_original(self):
+        """Si no hay tag devuelve summary vacío y el texto sin modificar."""
+        summary, remaining = _parse_media_summary("Respuesta normal sin tag")
+        assert summary == ""
+        assert remaining == "Respuesta normal sin tag"
+
+    def test_empty_string(self):
+        summary, remaining = _parse_media_summary("")
+        assert summary == ""
+        assert remaining == ""
+
+    def test_tag_with_leading_whitespace(self):
+        """Espacios antes del tag se toleran."""
+        summary, remaining = _parse_media_summary(
+            "  [media_summary: audio de saludo] ¡Buenas!"
+        )
+        assert summary == "audio de saludo"
+        assert remaining == "¡Buenas!"
+
+    def test_case_insensitive(self):
+        """El tag es case-insensitive."""
+        summary, _ = _parse_media_summary("[MEDIA_SUMMARY: prueba] texto")
+        assert summary == "prueba"
+
+    def test_multi_word_summary(self):
+        summary, remaining = _parse_media_summary(
+            "[media_summary: el usuario pregunta qué hora es y cómo está el robot] Respuesta."
+        )
+        assert "qué hora es" in summary
+        assert remaining == "Respuesta."
+
+    def test_only_tag_no_remaining(self):
+        """Tag sin texto posterior."""
+        summary, remaining = _parse_media_summary("[media_summary: solo audio] ")
+        assert summary == "solo audio"
+        assert remaining == ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECCIÓN 4c — _process_interaction con media (audio/imagen/video)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestProcessInteractionMedia:
+    """Tests del flujo media: extracción de [media_summary:] y uso como historial."""
+
+    async def _run_process_audio(self, *chunks: str) -> tuple[MagicMock, AsyncMock]:
+        """Helper: lanza _process_interaction con audio_data y devuelve (ws, save_history_mock)."""
+        ws = make_mock_ws()
+        history_service = ConversationHistory()
+        save_history_mock = AsyncMock()
+
+        with (
+            patch("ws_handlers.streaming.run_agent_stream", make_async_gen(*chunks)),
+            patch("ws_handlers.streaming._save_history_bg", save_history_mock),
+            patch("ws_handlers.streaming._save_interaction_bg", new_callable=AsyncMock),
+            patch(
+                "ws_handlers.streaming._load_memories",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            await _process_interaction(
+                websocket=ws,
+                user_id="user_test",
+                request_id="req-audio",
+                user_input=None,
+                input_type="audio",
+                audio_data=b"\x00\x01\x02",
+                history_service=history_service,
+                session_id="sess-test",
+                agent=None,
+            )
+            await asyncio.sleep(0)
+
+        return ws, save_history_mock
+
+    async def test_media_summary_tag_not_sent_as_text_chunk(self):
+        """El tag [media_summary:...] NO debe aparecer en los text_chunks enviados al robot."""
+        ws, _ = await self._run_process_audio(
+            "[emotion:happy][media_summary: el usuario dice buenos días] ¡Buenos días!"
+        )
+        sent = [json.loads(c[0][0]) for c in ws.send_text.call_args_list]
+        chunks_text = "".join(m["text"] for m in sent if m["type"] == "text_chunk")
+        assert "[media_summary:" not in chunks_text
+        assert "¡Buenos días!" in chunks_text
+
+    async def test_media_summary_used_as_user_history(self):
+        """El contenido del [media_summary:...] se usa como mensaje del usuario en el historial."""
+        _, save_history_mock = await self._run_process_audio(
+            "[emotion:happy][media_summary: el usuario saluda y pregunta cómo está] ¡Hola!"
+        )
+        assert save_history_mock.called
+        kwargs = save_history_mock.call_args.kwargs
+        assert kwargs["user_message"] == "el usuario saluda y pregunta cómo está"
+
+    async def test_media_summary_split_across_chunks(self):
+        """El tag [media_summary:...] llegando partido en varios chunks se extrae correctamente."""
+        ws, save_history_mock = await self._run_process_audio(
+            "[emotion:neutral][media_summary: ",
+            "usuario envía nota de voz",
+            "] Entendido.",
+        )
+        kwargs = save_history_mock.call_args.kwargs
+        assert kwargs["user_message"] == "usuario envía nota de voz"
+        sent = [json.loads(c[0][0]) for c in ws.send_text.call_args_list]
+        chunks_text = "".join(m["text"] for m in sent if m["type"] == "text_chunk")
+        assert "[media_summary:" not in chunks_text
+
+    async def test_fallback_placeholder_when_no_summary_tag(self):
+        """Si el LLM no emite [media_summary:...] el historial usa el placeholder '[audio]'."""
+        _, save_history_mock = await self._run_process_audio(
+            "[emotion:happy] El audio no tenía etiqueta de resumen."
+        )
+        kwargs = save_history_mock.call_args.kwargs
+        assert kwargs["user_message"] == "[audio]"
+
+    async def test_text_input_not_affected(self):
+        """Las interacciones de texto siguen usando user_input como mensaje de historial."""
+        ws = make_mock_ws()
+        history_service = ConversationHistory()
+        save_history_mock = AsyncMock()
+
+        with (
+            patch(
+                "ws_handlers.streaming.run_agent_stream",
+                make_async_gen("[emotion:neutral] OK."),
+            ),
+            patch("ws_handlers.streaming._save_history_bg", save_history_mock),
+            patch("ws_handlers.streaming._save_interaction_bg", new_callable=AsyncMock),
+            patch(
+                "ws_handlers.streaming._load_memories",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            await _process_interaction(
+                websocket=ws,
+                user_id="user_test",
+                request_id="req-text",
+                user_input="¿Qué hora es?",
+                input_type="text",
+                history_service=history_service,
+                session_id="sess-test",
+                agent=None,
+            )
+            await asyncio.sleep(0)
+
+        kwargs = save_history_mock.call_args.kwargs
+        assert kwargs["user_message"] == "¿Qué hora es?"
+
+    async def test_emotion_still_sent_for_audio(self):
+        """Con audio, el tag [emotion:...] se extrae y envía correctamente."""
+        ws, _ = await self._run_process_audio(
+            "[emotion:excited][media_summary: usuario pide canción] ¡Vamos!"
+        )
+        sent = [json.loads(c[0][0]) for c in ws.send_text.call_args_list]
+        emotions = [m for m in sent if m["type"] == "emotion"]
+        assert len(emotions) == 1
+        assert emotions[0]["emotion"] == "excited"
+
+    async def test_stream_end_still_sent_for_audio(self):
+        """Con audio, stream_end se envía al final."""
+        ws, _ = await self._run_process_audio(
+            "[emotion:neutral][media_summary: audio de prueba] Respuesta."
+        )
+        sent = [json.loads(c[0][0]) for c in ws.send_text.call_args_list]
+        ends = [m for m in sent if m["type"] == "stream_end"]
+        assert len(ends) == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
