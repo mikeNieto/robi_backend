@@ -1,7 +1,15 @@
 """
 Base de datos — SQLAlchemy async con aiosqlite.
 
-Tablas: users, memories, interactions, conversation_history
+v2.0 — Robi Amigo Familiar
+
+Tablas:
+  people               — personas conocidas por Robi
+  face_embeddings      — embeddings faciales (N por persona)
+  zones                — mapa mental de la casa (nodos)
+  zone_paths           — caminos entre zonas (aristas)
+  memories             — recuerdos de Robi (person_id nullable, zone_id nullable)
+  conversation_history — historial de mensajes por sesión
 
 Uso:
     from db import engine, AsyncSessionLocal, create_all_tables
@@ -16,7 +24,7 @@ Uso:
 
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Index, String, Text, func
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -79,38 +87,101 @@ class Base(DeclarativeBase):
 # ── Tablas ────────────────────────────────────────────────────────────────────
 
 
-class UserRow(Base):
-    __tablename__ = "users"
+class PersonRow(Base):
+    __tablename__ = "people"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(
+    person_id: Mapped[str] = mapped_column(
         String(50), unique=True, nullable=False, index=True
-    )
+    )  # slug único, p.ej. "persona_juan_01"
     name: Mapped[str] = mapped_column(String(100), nullable=False)
-    face_embedding: Mapped[bytes | None] = mapped_column(
-        nullable=True
-    )  # vector 128D — desde Android
-    preferences: Mapped[str] = mapped_column(
-        Text, nullable=False, default="{}"
-    )  # JSON serializado
-    created_at: Mapped[datetime] = mapped_column(
+    first_seen: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now()
     )
     last_seen: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now()
     )
+    interaction_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    notes: Mapped[str] = mapped_column(
+        Text, nullable=False, default=""
+    )  # contexto libre: "le gusta el café", "trabaja de noche"
+
+
+class FaceEmbeddingRow(Base):
+    __tablename__ = "face_embeddings"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    person_id: Mapped[str] = mapped_column(
+        String(50),
+        ForeignKey("people.person_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    embedding: Mapped[bytes] = mapped_column(nullable=False)  # vector 128D serializado
+    captured_at: Mapped[datetime] = mapped_column(
+        nullable=False, server_default=func.now()
+    )
+    source_lighting: Mapped[str | None] = mapped_column(
+        String(20), nullable=True
+    )  # "day" | "night" | None
+
+    __table_args__ = (Index("ix_face_emb_person", "person_id", "captured_at"),)
+
+
+class ZoneRow(Base):
+    __tablename__ = "zones"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    category: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="unknown"
+    )  # kitchen | living | bedroom | bathroom | unknown
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    known_since: Mapped[datetime] = mapped_column(
+        nullable=False, server_default=func.now()
+    )
+    accessible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    current_robi_zone: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )  # solo una fila puede ser True a la vez
+
+
+class ZonePathRow(Base):
+    __tablename__ = "zone_paths"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    from_zone_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("zones.id", ondelete="CASCADE"), nullable=False
+    )
+    to_zone_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("zones.id", ondelete="CASCADE"), nullable=False
+    )
+    direction_hint: Mapped[str] = mapped_column(
+        Text, nullable=False, default=""
+    )  # "girar derecha 90° avanzar 2m"
+    distance_cm: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (Index("ix_zone_paths_from_to", "from_zone_id", "to_zone_id"),)
 
 
 class MemoryRow(Base):
     __tablename__ = "memories"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(
-        String(50), ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False
-    )
+    person_id: Mapped[str | None] = mapped_column(
+        String(50),
+        ForeignKey("people.person_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )  # nullable — hay memorias generales no ligadas a persona
+    zone_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("zones.id", ondelete="SET NULL"),
+        nullable=True,
+    )  # contexto espacial de la memoria
     memory_type: Mapped[str] = mapped_column(
         String(20), nullable=False
-    )  # fact | preference | conversation
+    )  # experience | zone_info | person_fact | general
     content: Mapped[str] = mapped_column(Text, nullable=False)
     importance: Mapped[int] = mapped_column(nullable=False, default=5)  # 1-10
     timestamp: Mapped[datetime] = mapped_column(
@@ -118,25 +189,10 @@ class MemoryRow(Base):
     )
     expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
-    __table_args__ = (Index("ix_memories_user_importance", "user_id", "importance"),)
-
-
-class InteractionRow(Base):
-    __tablename__ = "interactions"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(
-        String(50), ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False
+    __table_args__ = (
+        Index("ix_memories_person_importance", "person_id", "importance"),
+        Index("ix_memories_type_ts", "memory_type", "timestamp"),
     )
-    request_type: Mapped[str] = mapped_column(
-        String(20), nullable=False
-    )  # audio | vision | text
-    summary: Mapped[str] = mapped_column(Text, nullable=False)
-    timestamp: Mapped[datetime] = mapped_column(
-        nullable=False, server_default=func.now()
-    )
-
-    __table_args__ = (Index("ix_interactions_user_ts", "user_id", "timestamp"),)
 
 
 class ConversationHistoryRow(Base):
