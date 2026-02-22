@@ -1,20 +1,13 @@
 """
-Tests unitarios para los routers REST (paso 4).
+Tests unitarios v2.0 — Routers REST
 
 Estrategia:
   - SQLite in-memory vía init_db() + create_all_tables()
-  - get_session() lee db_module.AsyncSessionLocal en tiempo de ejecución,
-    por lo que apunta automáticamente a la base de datos en memoria.
-  - No se mockean repositorios — se usan los reales con la BD en memoria.
   - httpx.AsyncClient con ASGITransport levanta la app sin red.
 
-Tests:
-  - GET  /api/users
-  - GET  /api/users/{user_id}
-  - DELETE /api/users/{user_id}/memory
-  - POST /api/users/{user_id}/memory
-  - GET  /api/users/{user_id}/memory
-  - POST /api/face/register
+Endpoints cubiertos:
+  - GET /api/health
+  - GET /api/restore
 """
 
 import base64
@@ -24,9 +17,7 @@ from httpx import ASGITransport, AsyncClient
 
 import db as db_module
 from db import create_all_tables, drop_all_tables
-from main import app
 
-# API key configurada en conftest.py
 API_KEY = "test-api-key-for-unit-tests-only"
 HEADERS = {"X-API-Key": API_KEY}
 
@@ -48,328 +39,160 @@ async def in_memory_db():
 @pytest.fixture
 async def client():
     """Cliente HTTP apuntando a la app FastAPI via ASGI (sin red)."""
+    from main import app
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as c:
         yield c
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── GET /api/health ────────────────────────────────────────────────────────────
 
 
-async def _create_user(
-    client: AsyncClient, user_id: str = "user_test", name: str = "Test"
-) -> dict:
-    """Registra un usuario y devuelve el body de respuesta."""
-    embedding = base64.b64encode(b"\x01" * 128).decode()
-    resp = await client.post(
-        "/api/face/register",
-        json={"user_id": user_id, "name": name, "embedding_b64": embedding},
-        headers=HEADERS,
-    )
-    assert resp.status_code == 201, resp.text
-    return resp.json()
-
-
-async def _save_memory(
-    client: AsyncClient,
-    user_id: str = "user_test",
-    content: str = "Le gusta el café",
-    importance: int = 7,
-) -> dict:
-    resp = await client.post(
-        f"/api/users/{user_id}/memory",
-        json={"memory_type": "fact", "content": content, "importance": importance},
-        headers=HEADERS,
-    )
-    assert resp.status_code == 201, resp.text
-    return resp.json()
-
-
-# ── GET /api/users ─────────────────────────────────────────────────────────────
-
-
-class TestListUsers:
-    async def test_empty_list(self, client):
-        resp = await client.get("/api/users", headers=HEADERS)
+class TestHealth:
+    async def test_health_returns_ok(self, client):
+        resp = await client.get("/api/health")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["users"] == []
-        assert body["total"] == 0
+        assert body["status"] == "ok"
+        assert body["version"] == "2.0"
 
-    async def test_returns_created_users(self, client):
-        await _create_user(client, "user_a", "A")
-        await _create_user(client, "user_b", "B")
-        resp = await client.get("/api/users", headers=HEADERS)
+    async def test_health_no_api_key_required(self, client):
+        """Health check accesible sin API Key."""
+        resp = await client.get("/api/health")
+        assert resp.status_code == 200
+
+    async def test_health_with_api_key_also_works(self, client):
+        resp = await client.get("/api/health", headers=HEADERS)
+        assert resp.status_code == 200
+
+
+# ── GET /api/restore ───────────────────────────────────────────────────────────
+
+
+class TestRestore:
+    async def test_restore_empty_db(self, client):
+        """Restore con BD vacía devuelve listas vacías."""
+        resp = await client.get("/api/restore", headers=HEADERS)
         assert resp.status_code == 200
         body = resp.json()
-        assert body["total"] == 2
-        user_ids = {u["user_id"] for u in body["users"]}
-        assert user_ids == {"user_a", "user_b"}
+        assert body["people"] == []
+        assert body["zones"] == []
+        assert body["general_memories"] == []
 
-    async def test_requires_api_key(self, client):
-        resp = await client.get("/api/users")
+    async def test_restore_requires_api_key(self, client):
+        resp = await client.get("/api/restore")
         assert resp.status_code == 401
 
-    async def test_response_shape(self, client):
-        await _create_user(client)
-        resp = await client.get("/api/users", headers=HEADERS)
-        user = resp.json()["users"][0]
-        assert "user_id" in user
-        assert "name" in user
-        assert "created_at" in user
-        assert "last_seen" in user
-        assert "has_face_embedding" in user
-        assert user["has_face_embedding"] is True
+    async def test_restore_with_person(self, client):
+        """Restore debe devolver personas registradas en la BD."""
+        from db import PersonRow, AsyncSessionLocal
+        assert AsyncSessionLocal is not None
+        async with AsyncSessionLocal() as s:
+            s.add(PersonRow(person_id="persona_test_001", name="Test"))
+            await s.commit()
 
-
-# ── GET /api/users/{user_id} ──────────────────────────────────────────────────
-
-
-class TestGetUser:
-    async def test_found(self, client):
-        await _create_user(client, "user_juan", "Juan")
-        resp = await client.get("/api/users/user_juan", headers=HEADERS)
+        resp = await client.get("/api/restore", headers=HEADERS)
         assert resp.status_code == 200
         body = resp.json()
-        assert body["user_id"] == "user_juan"
-        assert body["name"] == "Juan"
+        assert len(body["people"]) == 1
+        assert body["people"][0]["person_id"] == "persona_test_001"
+        assert body["people"][0]["name"] == "Test"
+        assert body["people"][0]["face_embeddings"] == []
 
-    async def test_not_found_returns_404(self, client):
-        resp = await client.get("/api/users/nonexistent", headers=HEADERS)
-        assert resp.status_code == 404
-        body = resp.json()
-        assert body["error"] is True
-        assert body["error_code"] == "NOT_FOUND"
+    async def test_restore_with_zone(self, client):
+        """Restore debe devolver zonas con sus paths."""
+        from db import ZoneRow, ZonePathRow, AsyncSessionLocal
+        assert AsyncSessionLocal is not None
+        async with AsyncSessionLocal() as s:
+            z1 = ZoneRow(name="sala", category="living_area")
+            z2 = ZoneRow(name="cocina", category="kitchen")
+            s.add_all([z1, z2])
+            await s.flush()
+            s.add(ZonePathRow(from_zone_id=z1.id, to_zone_id=z2.id, direction_hint="norte"))
+            await s.commit()
 
-    async def test_has_face_embedding_true(self, client):
-        await _create_user(client)
-        resp = await client.get("/api/users/user_test", headers=HEADERS)
-        assert resp.json()["has_face_embedding"] is True
-
-
-# ── DELETE /api/users/{user_id}/memory ───────────────────────────────────────
-
-
-class TestDeleteUserMemory:
-    async def test_deletes_all_memories(self, client):
-        await _create_user(client)
-        await _save_memory(client, content="Mem 1")
-        await _save_memory(client, content="Mem 2")
-
-        resp = await client.delete("/api/users/user_test/memory", headers=HEADERS)
+        resp = await client.get("/api/restore", headers=HEADERS)
         assert resp.status_code == 200
         body = resp.json()
-        assert body["deleted"] == 2
+        zones = {z["name"]: z for z in body["zones"]}
+        assert "sala" in zones
+        assert "cocina" in zones
+        assert len(zones["sala"]["paths"]) == 1
+        assert zones["sala"]["paths"][0]["direction_hint"] == "norte"
 
-    async def test_delete_on_empty_returns_zero(self, client):
-        await _create_user(client)
-        resp = await client.delete("/api/users/user_test/memory", headers=HEADERS)
-        assert resp.status_code == 200
-        assert resp.json()["deleted"] == 0
+    async def test_restore_with_general_memory(self, client):
+        """Restore incluye memorias generales (sin persona)."""
+        from db import MemoryRow, AsyncSessionLocal
+        assert AsyncSessionLocal is not None
+        async with AsyncSessionLocal() as s:
+            s.add(MemoryRow(
+                memory_type="general",
+                content="La casa tiene jardín",
+                importance=5,
+            ))
+            await s.commit()
 
-    async def test_delete_memory_user_not_found(self, client):
-        resp = await client.delete("/api/users/ghost/memory", headers=HEADERS)
-        assert resp.status_code == 404
-
-    async def test_memories_gone_after_delete(self, client):
-        await _create_user(client)
-        await _save_memory(client, content="Borrar esto")
-        await client.delete("/api/users/user_test/memory", headers=HEADERS)
-
-        resp = await client.get("/api/users/user_test/memory", headers=HEADERS)
-        assert resp.json()["total"] == 0
-
-
-# ── POST /api/users/{user_id}/memory ─────────────────────────────────────────
-
-
-class TestSaveMemory:
-    async def test_saves_and_returns_id(self, client):
-        await _create_user(client)
-        resp = await client.post(
-            "/api/users/user_test/memory",
-            json={"memory_type": "fact", "content": "Habla español", "importance": 8},
-            headers=HEADERS,
-        )
-        assert resp.status_code == 201
-        body = resp.json()
-        assert "id" in body
-        assert isinstance(body["id"], int)
-
-    async def test_user_not_found_404(self, client):
-        resp = await client.post(
-            "/api/users/ghost/memory",
-            json={"memory_type": "fact", "content": "Habla español", "importance": 5},
-            headers=HEADERS,
-        )
-        assert resp.status_code == 404
-
-    async def test_private_content_rejected_422(self, client):
-        await _create_user(client)
-        resp = await client.post(
-            "/api/users/user_test/memory",
-            json={
-                "memory_type": "fact",
-                "content": "Su contraseña es abc123",
-                "importance": 5,
-            },
-            headers=HEADERS,
-        )
-        assert resp.status_code == 422
-
-    async def test_invalid_memory_type_422(self, client):
-        await _create_user(client)
-        resp = await client.post(
-            "/api/users/user_test/memory",
-            json={"memory_type": "invalid", "content": "Dato", "importance": 5},
-            headers=HEADERS,
-        )
-        assert resp.status_code == 422
-
-    async def test_importance_out_of_range_422(self, client):
-        await _create_user(client)
-        resp = await client.post(
-            "/api/users/user_test/memory",
-            json={"memory_type": "fact", "content": "Dato", "importance": 11},
-            headers=HEADERS,
-        )
-        assert resp.status_code == 422
-
-    async def test_invalid_expires_at_422(self, client):
-        await _create_user(client)
-        resp = await client.post(
-            "/api/users/user_test/memory",
-            json={
-                "memory_type": "fact",
-                "content": "Dato",
-                "importance": 5,
-                "expires_at": "not-a-date",
-            },
-            headers=HEADERS,
-        )
-        assert resp.status_code == 422
-
-    async def test_valid_expires_at_accepted(self, client):
-        await _create_user(client)
-        resp = await client.post(
-            "/api/users/user_test/memory",
-            json={
-                "memory_type": "preference",
-                "content": "Prefiere la tarde",
-                "importance": 6,
-                "expires_at": "2027-12-31T23:59:59",
-            },
-            headers=HEADERS,
-        )
-        assert resp.status_code == 201
-
-    async def test_default_importance_5(self, client):
-        await _create_user(client)
-        resp = await client.post(
-            "/api/users/user_test/memory",
-            json={"content": "Sin importancia explícita"},
-            headers=HEADERS,
-        )
-        assert resp.status_code == 201
-
-
-# ── GET /api/users/{user_id}/memory ──────────────────────────────────────────
-
-
-class TestGetMemory:
-    async def test_empty_list(self, client):
-        await _create_user(client)
-        resp = await client.get("/api/users/user_test/memory", headers=HEADERS)
+        resp = await client.get("/api/restore", headers=HEADERS)
         assert resp.status_code == 200
         body = resp.json()
-        assert body["user_id"] == "user_test"
-        assert body["memories"] == []
-        assert body["total"] == 0
+        assert len(body["general_memories"]) == 1
+        assert body["general_memories"][0]["content"] == "La casa tiene jardín"
 
-    async def test_returns_saved_memories(self, client):
-        await _create_user(client)
-        await _save_memory(client, content="Dato 1", importance=8)
-        await _save_memory(client, content="Dato 2", importance=6)
-        resp = await client.get("/api/users/user_test/memory", headers=HEADERS)
+    async def test_restore_excludes_person_memories(self, client):
+        """Restore NO incluye memorias con person_id (solo generales)."""
+        from db import PersonRow, MemoryRow, AsyncSessionLocal
+        assert AsyncSessionLocal is not None
+        async with AsyncSessionLocal() as s:
+            s.add(PersonRow(person_id="p1", name="P1"))
+            await s.flush()
+            s.add(MemoryRow(
+                memory_type="person_fact",
+                content="Le gusta el jazz",
+                importance=7,
+                person_id="p1",
+            ))
+            s.add(MemoryRow(
+                memory_type="general",
+                content="Recuerdo general",
+                importance=5,
+            ))
+            await s.commit()
+
+        resp = await client.get("/api/restore", headers=HEADERS)
         body = resp.json()
-        assert body["total"] == 2
+        mems = body["general_memories"]
+        assert len(mems) == 1
+        assert mems[0]["content"] == "Recuerdo general"
 
-    async def test_ordered_by_importance_desc(self, client):
-        await _create_user(client)
-        await _save_memory(client, content="Baja", importance=3)
-        await _save_memory(client, content="Alta", importance=9)
-        resp = await client.get("/api/users/user_test/memory", headers=HEADERS)
-        mems = resp.json()["memories"]
-        importances = [m["importance"] for m in mems]
-        assert importances == sorted(importances, reverse=True)
+    async def test_restore_with_embedding(self, client):
+        """Restore devuelve embeddings faciales en base64."""
+        from db import PersonRow, FaceEmbeddingRow, AsyncSessionLocal
+        assert AsyncSessionLocal is not None
+        async with AsyncSessionLocal() as s:
+            s.add(PersonRow(person_id="p_emb", name="Embed"))
+            await s.flush()
+            s.add(FaceEmbeddingRow(person_id="p_emb", embedding=b"\x01" * 128))
+            await s.commit()
 
-    async def test_user_not_found_404(self, client):
-        resp = await client.get("/api/users/ghost/memory", headers=HEADERS)
-        assert resp.status_code == 404
-
-    async def test_memory_item_shape(self, client):
-        await _create_user(client)
-        await _save_memory(client)
-        resp = await client.get("/api/users/user_test/memory", headers=HEADERS)
-        item = resp.json()["memories"][0]
-        assert "id" in item
-        assert "memory_type" in item
-        assert "content" in item
-        assert "importance" in item
-        assert "timestamp" in item
-        assert "expires_at" in item
-
-
-# ── POST /api/face/register ───────────────────────────────────────────────────
-
-
-class TestFaceRegister:
-    def _payload(self, user_id: str = "user_new", name: str = "New") -> dict:
-        embedding = base64.b64encode(b"\x02" * 128).decode()
-        return {"user_id": user_id, "name": name, "embedding_b64": embedding}
-
-    async def test_register_creates_user(self, client):
-        resp = await client.post(
-            "/api/face/register", json=self._payload(), headers=HEADERS
-        )
-        assert resp.status_code == 201
+        resp = await client.get("/api/restore", headers=HEADERS)
         body = resp.json()
-        assert body["user_id"] == "user_new"
-        assert body["name"] == "New"
+        person = next(p for p in body["people"] if p["person_id"] == "p_emb")
+        assert len(person["face_embeddings"]) == 1
+        # Debe ser base64 válido
+        decoded = base64.b64decode(person["face_embeddings"][0])
+        assert len(decoded) == 128
 
-    async def test_duplicate_user_id_409(self, client):
-        payload = self._payload()
-        await client.post("/api/face/register", json=payload, headers=HEADERS)
-        resp = await client.post("/api/face/register", json=payload, headers=HEADERS)
-        assert resp.status_code == 409
+    async def test_restore_current_zone_flagged(self, client):
+        """La zona actual de Robi tiene is_current=True."""
+        from db import ZoneRow, AsyncSessionLocal
+        assert AsyncSessionLocal is not None
+        async with AsyncSessionLocal() as s:
+            z = ZoneRow(name="sala", category="living_area", current_robi_zone=True)
+            s.add(z)
+            await s.commit()
 
-    async def test_invalid_base64_400(self, client):
-        resp = await client.post(
-            "/api/face/register",
-            json={
-                "user_id": "user_b64",
-                "name": "B64",
-                "embedding_b64": "!!!invalid!!!",
-            },
-            headers=HEADERS,
-        )
-        assert resp.status_code == 400
-
-    async def test_user_appears_in_list(self, client):
-        await client.post("/api/face/register", json=self._payload(), headers=HEADERS)
-        resp = await client.get("/api/users", headers=HEADERS)
-        user_ids = [u["user_id"] for u in resp.json()["users"]]
-        assert "user_new" in user_ids
-
-    async def test_missing_fields_422(self, client):
-        resp = await client.post(
-            "/api/face/register",
-            json={"user_id": "user_x"},
-            headers=HEADERS,
-        )
-        assert resp.status_code == 422
-
-    async def test_requires_api_key(self, client):
-        resp = await client.post("/api/face/register", json=self._payload())
-        assert resp.status_code == 401
+        resp = await client.get("/api/restore", headers=HEADERS)
+        body = resp.json()
+        sala = next(z for z in body["zones"] if z["name"] == "sala")
+        assert sala["is_current"] is True

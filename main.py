@@ -24,10 +24,8 @@ from middleware.error_handler import register_error_handlers
 from middleware.logging import LoggingMiddleware
 from fastapi import WebSocket
 
-from routers.face import router as face_router
 from routers.health import router as health_router
-from routers.memory import router as memory_router
-from routers.users import router as users_router
+from routers.restore import router as restore_router
 from ws_handlers.streaming import ws_interact
 
 
@@ -40,7 +38,11 @@ async def lifespan(app: FastAPI):
     init_db()
     await create_all_tables()
     yield
-    # Shutdown (nada que limpiar por ahora)
+    # Shutdown
+    from db import engine as _engine
+
+    if _engine is not None:
+        await _engine.dispose()
 
 
 # ── Aplicación ────────────────────────────────────────────────────────────────
@@ -48,8 +50,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Robi Backend",
-    version="1.4",
-    description="Backend del robot doméstico Robi — FastAPI + WebSocket + Gemini",
+    version="2.0",
+    description="Backend de Robi — Amigo Familiar | FastAPI + WebSocket + Gemini",
     lifespan=lifespan,
     # Deshabilitar docs en producción si se desea
     docs_url="/docs" if not settings.is_production else None,
@@ -76,9 +78,7 @@ register_error_handlers(app)
 # ── Routers ───────────────────────────────────────────────────────────────────
 
 app.include_router(health_router)
-app.include_router(users_router)
-app.include_router(memory_router)
-app.include_router(face_router)
+app.include_router(restore_router)
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────

@@ -93,8 +93,6 @@ class PeopleRepository:
         row = result.scalar_one()
         row.last_seen = datetime.now(timezone.utc)
         row.interaction_count = (row.interaction_count or 0) + 1
-        if name and row.name != name:
-            row.name = name
         await self._session.flush()
         await self._session.refresh(row)
         return _row_to_person(row), False

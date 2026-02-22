@@ -46,7 +46,9 @@ class FaceEmbedding:
 # ── Zonas / Mapa mental ───────────────────────────────────────────────────────
 
 # Categorías válidas de zona
-ZONE_CATEGORIES = frozenset({"kitchen", "living", "bedroom", "bathroom", "unknown"})
+ZONE_CATEGORIES = frozenset(
+    {"kitchen", "living_area", "bedroom", "bathroom", "outdoor", "unknown"}
+)
 
 
 @dataclass

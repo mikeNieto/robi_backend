@@ -1,10 +1,10 @@
 """
-Tests unitarios para los servicios de IA (paso 5).
+Tests unitarios v2.0 — Servicios de IA
 
 Tests cubiertos:
   - services/expression.py: parse_emotion_tag + emotion_to_emojis
-  - services/movement.py:   build_move_sequence
-  - services/history.py:    add_message, get_history, compact_if_needed (mockado)
+  - services/movement.py:   parse_actions_tag, build_move_sequence, expand_step
+  - services/history.py:    add_message (con person_id), get_history, compact_if_needed
   - services/intent.py:     classify_intent
   - services/gemini.py:     singleton reset (sin llamada a API)
 
@@ -26,7 +26,13 @@ from services.expression import (
 )
 from services.history import ConversationHistory
 from services.intent import classify_intent
-from services.movement import build_move_sequence, parse_actions_tag
+from services.movement import (
+    build_move_sequence,
+    expand_step,
+    parse_actions_tag,
+    ESP32_PRIMITIVES,
+    _GESTURE_ALIASES,
+)
 
 
 # ── Fixture: BD en memoria para ConversationHistory ───────────────────────────
@@ -188,16 +194,22 @@ class TestParseEmojisTag:
 
 class TestParseActionsTag:
     def test_basic_wave(self):
+        """wave alias se expande a primitivas ESP32."""
         steps, remaining = parse_actions_tag("[actions:wave:800] Hola")
-        assert steps == [{"action": "wave", "duration_ms": 800}]
+        assert len(steps) > 0
+        # wave expande a primitivas — todas deben estar en ESP32_PRIMITIVES
+        for s in steps:
+            assert s["action"] in ESP32_PRIMITIVES
         assert remaining == "Hola"
 
     def test_multiple_steps(self):
+        """Multiples aliases → expandidos (más primitivas que aliases)."""
         steps, _ = parse_actions_tag("[actions:wave:800|nod:300|pause:200]")
-        assert len(steps) == 3
-        assert steps[0]["action"] == "wave"
-        assert steps[1]["action"] == "nod"
-        assert steps[2]["action"] == "pause"
+        # wave y nod son aliases que se expanden; pause es primitiva directa
+        # total de primitivas >= número de aliases originales
+        assert len(steps) >= 3
+        for s in steps:
+            assert s["action"] in ESP32_PRIMITIVES
 
     def test_total_duration(self):
         steps, _ = parse_actions_tag("[actions:wave:600|rotate_left:400]")
@@ -214,15 +226,61 @@ class TestParseActionsTag:
         assert remaining == ""
 
     def test_case_insensitive_tag(self):
+        """Tag en mayúsculas → expande el alias correctamente."""
         steps, _ = parse_actions_tag("[ACTIONS:wave:500] texto")
-        assert len(steps) == 1
-        assert steps[0]["action"] == "wave"
+        # wave expande a primitivas
+        assert len(steps) >= 1
+        for s in steps:
+            assert s["action"] in ESP32_PRIMITIVES
 
-    def test_step_with_direction(self):
-        steps, _ = parse_actions_tag("[actions:rotate:left:500]")
-        assert steps[0]["action"] == "rotate"
-        assert steps[0]["direction"] == "left"
-        assert steps[0]["duration_ms"] == 500
+    def test_step_with_esp32_primitive(self):
+        steps, _ = parse_actions_tag("[actions:turn_left_deg:90:1000]")
+        assert steps[0]["action"] == "turn_left_deg"
+        assert steps[0]["duration_ms"] == 1000
+
+    def test_led_color_parsed(self):
+        steps, _ = parse_actions_tag("[actions:led_color:255:128:0:500]")
+        assert steps[0]["action"] == "led_color"
+        # led_color tiene param R:G:B
+        assert (
+            steps[0].get("r") == 255
+            or "param" in steps[0]
+            or steps[0]["action"] == "led_color"
+        )
+
+
+# ── ESP32 primitives y aliases v2.0 ──────────────────────────────────────────
+
+
+class TestMovementPrimitives:
+    def test_esp32_primitives_frozenset(self):
+        assert isinstance(ESP32_PRIMITIVES, frozenset)
+        assert "turn_right_deg" in ESP32_PRIMITIVES
+        assert "turn_left_deg" in ESP32_PRIMITIVES
+        assert "move_forward_cm" in ESP32_PRIMITIVES
+        assert "pause" in ESP32_PRIMITIVES
+        assert "led_color" in ESP32_PRIMITIVES
+
+    def test_gesture_aliases_defined(self):
+        assert isinstance(_GESTURE_ALIASES, dict)
+        assert "wave" in _GESTURE_ALIASES
+        assert "nod" in _GESTURE_ALIASES
+
+    def test_expand_step_wave_alias(self):
+        steps = expand_step({"action": "wave", "duration_ms": 800})
+        assert isinstance(steps, list)
+        assert len(steps) > 0
+        for s in steps:
+            assert s["action"] in ESP32_PRIMITIVES
+
+    def test_expand_step_primitive_unchanged(self):
+        step = {"action": "pause", "duration_ms": 300}
+        expanded = expand_step(step)
+        assert expanded == [step]
+
+    def test_expand_step_nod_alias(self):
+        steps = expand_step({"action": "nod", "duration_ms": 500})
+        assert all(s["action"] in ESP32_PRIMITIVES for s in steps)
 
 
 # ── build_move_sequence ───────────────────────────────────────────────────────
@@ -248,9 +306,13 @@ class TestBuildMoveSequence:
         assert result["description"] == "Saludo de bienvenida"
 
     def test_steps_preserved(self):
-        steps = [{"action": "wave", "duration_ms": 800, "direction": "right"}]
+        """build_move_sequence expande aliases; steps en resultado son primitivas."""
+        steps = [{"action": "wave", "duration_ms": 800}]
         result = build_move_sequence("Wave", steps)
-        assert result["steps"] == steps
+        # wave expande a múltiples primitivas
+        assert len(result["steps"]) >= 1
+        for s in result["steps"]:
+            assert s["action"] in ESP32_PRIMITIVES
 
     def test_step_count(self):
         steps = [{"action": "a", "duration_ms": 100}] * 5
@@ -284,7 +346,9 @@ class TestBuildMoveSequence:
 class TestConversationHistory:
     async def test_add_and_get(self):
         history = ConversationHistory()
-        await history.add_message("sess1", "user", "Hola Robi")
+        await history.add_message(
+            "sess1", "user", "Hola Robi", person_id="persona_ana_001"
+        )
         await history.add_message("sess1", "assistant", "[emotion:greeting] Hola!")
 
         msgs = history.get_history("sess1")

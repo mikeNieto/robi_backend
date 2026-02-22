@@ -1,5 +1,5 @@
 """
-Tests unitarios — Paso 2: Middleware e Infraestructura HTTP
+Tests unitarios v2.0 — Middleware e Infraestructura HTTP
 
 Cubre:
   - APIKeyMiddleware: clave válida / inválida / ausente
@@ -38,7 +38,7 @@ async def test_health_no_api_key():
     async with _client() as client:
         r = await client.get("/api/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "version": "1.4"}
+    assert r.json() == {"status": "ok", "version": "2.0"}
 
 
 @pytest.mark.asyncio
@@ -58,9 +58,7 @@ async def test_health_with_api_key():
 async def test_api_key_missing_returns_401():
     """Sin X-API-Key en rutas REST protegidas → 401."""
     async with _client() as client:
-        r = await client.get(
-            "/api/users"
-        )  # ruta que no existe aún, pero el middleware actúa primero
+        r = await client.get("/api/restore")
     assert r.status_code == 401
     body = r.json()
     assert body["error"] is True
@@ -72,7 +70,7 @@ async def test_api_key_missing_returns_401():
 async def test_api_key_wrong_returns_401():
     """API Key incorrecta → 401 con formato §3.9."""
     async with _client() as client:
-        r = await client.get("/api/users", headers={"X-API-Key": "wrong-key"})
+        r = await client.get("/api/restore", headers={"X-API-Key": "wrong-key"})
     assert r.status_code == 401
     body = r.json()
     assert body["error_code"] == "INVALID_API_KEY"
@@ -91,7 +89,7 @@ async def test_api_key_valid_passes_through():
 @pytest.mark.asyncio
 async def test_api_key_empty_string_returns_401():
     async with _client() as client:
-        r = await client.get("/api/users", headers={"X-API-Key": ""})
+        r = await client.get("/api/restore", headers={"X-API-Key": ""})
     assert r.status_code == 401
 
 
@@ -141,7 +139,7 @@ async def test_404_error_format():
 async def test_error_response_has_all_fields():
     """El cuerpo de error debe incluir todos los campos de §3.9."""
     async with _client() as client:
-        r = await client.get("/api/users", headers={"X-API-Key": "bad"})
+        r = await client.get("/api/restore", headers={"X-API-Key": "bad"})
     body = r.json()
     required = {
         "error",

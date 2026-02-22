@@ -1,6 +1,8 @@
 """
 ws_handlers/protocol.py — Funciones helper para construir mensajes del protocolo WS.
 
+v2.0 — Robi Amigo Familiar
+
 Cada función devuelve un str JSON listo para enviar por WebSocket.
 Los modelos Pydantic de referencia están en models/ws_messages.py.
 
@@ -36,18 +38,10 @@ def make_auth_ok(session_id: str) -> str:
     return _to_json({"type": "auth_ok", "session_id": session_id})
 
 
-def make_user_registered(user_id: str, name: str) -> str:
-    """
-    Confirmación de registro de nuevo usuario.
-    {"type": "user_registered", "user_id": "...", "name": "..."}
-    """
-    return _to_json({"type": "user_registered", "user_id": user_id, "name": name})
-
-
 def make_emotion(
     request_id: str,
     emotion: str,
-    user_identified: str | None = None,
+    person_identified: str | None = None,
     confidence: float | None = None,
 ) -> str:
     """
@@ -59,8 +53,8 @@ def make_emotion(
         "request_id": request_id,
         "emotion": emotion,
     }
-    if user_identified is not None:
-        msg["user_identified"] = user_identified
+    if person_identified is not None:
+        msg["person_identified"] = person_identified
     if confidence is not None:
         msg["confidence"] = confidence
     return _to_json(msg)
@@ -97,24 +91,27 @@ def make_response_meta(
     actions: list[dict] | None = None,
     duration_per_emoji: int = 2000,
     transition: str = "bounce",
+    person_name: str | None = None,
 ) -> str:
     """
     Metadata de respuesta enviada al finalizar el stream de texto.
-    Incluye secuencias de emojis y acciones de movimiento/luz.
+    Incluye secuencias de emojis, acciones de movimiento/luz y, si se extrajo,
+    el nombre de la persona registrada en este turno.
     """
-    return _to_json(
-        {
-            "type": "response_meta",
-            "request_id": request_id,
-            "response_text": response_text,
-            "expression": {
-                "emojis": emojis,
-                "duration_per_emoji": duration_per_emoji,
-                "transition": transition,
-            },
-            "actions": actions or [],
-        }
-    )
+    payload: dict = {
+        "type": "response_meta",
+        "request_id": request_id,
+        "response_text": response_text,
+        "expression": {
+            "emojis": emojis,
+            "duration_per_emoji": duration_per_emoji,
+            "transition": transition,
+        },
+        "actions": actions or [],
+    }
+    if person_name is not None:
+        payload["person_name"] = person_name
+    return _to_json(payload)
 
 
 def make_stream_end(request_id: str, processing_time_ms: int = 0) -> str:
@@ -150,3 +147,53 @@ def make_error(
     if request_id is not None:
         msg["request_id"] = request_id
     return _to_json(msg)
+
+
+# ── Mensajes nuevos v2.0 ─────────────────────────────────────────────────────────
+
+
+def make_exploration_actions(
+    request_id: str,
+    actions: list[dict],
+    exploration_speech: str = "",
+) -> str:
+    """
+    Instrucciones de movimiento + speech para el modo exploración autónoma.
+    {"type": "exploration_actions", "request_id": "...", "actions": [...], "exploration_speech": "..."}
+    """
+    return _to_json(
+        {
+            "type": "exploration_actions",
+            "request_id": request_id,
+            "actions": actions,
+            "exploration_speech": exploration_speech,
+        }
+    )
+
+
+def make_face_scan_actions(request_id: str, actions: list[dict]) -> str:
+    """
+    Secuencia de primitivas ESP32 para que Robi gire buscando personas.
+    {"type": "face_scan_actions", "request_id": "...", "actions": [...]}
+    """
+    return _to_json(
+        {
+            "type": "face_scan_actions",
+            "request_id": request_id,
+            "actions": actions,
+        }
+    )
+
+
+def make_low_battery_alert(battery_level: int, source: str) -> str:
+    """
+    Alerta de batería baja del robot o del teléfono.
+    {"type": "low_battery_alert", "battery_level": 12, "source": "robot"}
+    """
+    return _to_json(
+        {
+            "type": "low_battery_alert",
+            "battery_level": battery_level,
+            "source": source,
+        }
+    )

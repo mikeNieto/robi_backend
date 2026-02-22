@@ -1,15 +1,16 @@
 """
 ws_handlers/streaming.py — Handler WebSocket principal para /ws/interact.
 
-Implementa el flujo completo de §3.4:
+v2.0 — Robi Amigo Familiar
+
+Implementa el flujo completo:
   1. Acepta la conexión y autentica vía API Key.
-  2. Bucle de mensajes: acumula audio binario, maneja texto e interaction_start.
-  3. Al recibir audio_end o text: carga memoria, historial y lanza el agente.
-  4. Parsea [emotion:TAG] del primer token del stream → envía emotion de inmediato.
-  5. Envía text_chunk progresivamente.
-  6. Al finalizar el stream: classify_intent → capture_request si aplica.
-  7. Envía response_meta y stream_end.
-  8. Background: guarda messages en el historial + compactación.
+  2. Bucle de mensajes: gestiona todos los tipos de mensaje del protocolo v2.0.
+  3. Nuevos tipos: explore_mode, face_scan_mode, zone_update, person_detected.
+  4. Parsea tags del LLM: [emotion:], [emojis:], [actions:], [memory:],
+     [person_name:], [zone_learn:], [media_summary:].
+  5. Envía emotion + text_chunks progresivamente + response_meta + stream_end.
+  6. Background: historial + compactación de memorias.
 
 Uso (registrado en main.py):
     from ws_handlers.streaming import ws_interact
@@ -25,16 +26,17 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
 
 import db as db_module
 from fastapi import WebSocket
 from starlette.websockets import WebSocketState
 
-from db import InteractionRow
 from repositories.memory import MemoryRepository
+from repositories.people import PeopleRepository
+from repositories.zones import ZonesRepository
 from services.agent import create_agent, run_agent_stream
 from services.expression import emotion_to_emojis, parse_emotion_tag, parse_emojis_tag
+from services.memory_compaction import compact_memories_async
 from services.movement import build_move_sequence, parse_actions_tag
 from services.history import ConversationHistory
 from services.intent import classify_intent
@@ -43,6 +45,8 @@ from ws_handlers.protocol import (
     make_capture_request,
     make_emotion,
     make_error,
+    make_exploration_actions,
+    make_face_scan_actions,
     make_response_meta,
     make_stream_end,
     make_text_chunk,
@@ -52,16 +56,42 @@ from ws_handlers.protocol import (
 logger = logging.getLogger(__name__)
 
 # Tamaño máximo del buffer de cabecera para capturar todos los tags de control:
-# [emotion:TAG][emojis:CODE,...][actions:step|...][media_summary: ...]
+# [emotion:TAG][emojis:CODE,...][actions:step|...]
 _MAX_HEADER_BUFFER = 500
 
-# Regex para eliminar/extraer el tag [media_summary: ...] de texto producido por el LLM
+# Tags al final de la respuesta del LLM (se extraen y se eliminan del texto visible)
 _MEDIA_SUMMARY_RE = re.compile(
     r"\[media_summary:\s*.*?\]",
     re.DOTALL | re.IGNORECASE,
 )
-# String literal de apertura del tag (para búsqueda rápida case-insensitive en pending_buf)
 _MEDIA_SUMMARY_OPEN = "[media_summary:"
+
+# [memory:TIPO:contenido]  — LLM decide guardar un recuerdo
+_MEMORY_TAG_RE = re.compile(
+    r"\[memory:([a-z_]+):([^\]]+)\]",
+    re.IGNORECASE,
+)
+
+# [person_name:NOMBRE]  — LLM extrae nombre del audio de presentación
+_PERSON_NAME_TAG_RE = re.compile(
+    r"\[person_name:([^\]]+)\]",
+    re.IGNORECASE,
+)
+
+# [zone_learn:NOMBRE:CATEGORIA:descripción]  — LLM registra/actualiza zona
+_ZONE_LEARN_TAG_RE = re.compile(
+    r"\[zone_learn:([^:]+):([^:]+):([^\]]+)\]",
+    re.IGNORECASE,
+)
+
+# Secuencia de giro ESP32 para face_scan_mode
+_FACE_SCAN_SEQUENCE: list[dict] = [
+    {"action": "turn_right_deg", "degrees": 45, "duration_ms": 500},
+    {"action": "pause", "duration_ms": 300},
+    {"action": "turn_left_deg", "degrees": 90, "duration_ms": 800},
+    {"action": "pause", "duration_ms": 300},
+    {"action": "turn_right_deg", "degrees": 45, "duration_ms": 500},
+]
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -86,9 +116,11 @@ async def ws_interact(websocket: WebSocket) -> None:
     agent = create_agent()
 
     # Estado de la interacción actual
-    user_id: str = "unknown"
+    person_id: str | None = None  # slug de la persona identificada
+    current_zone: str | None = None  # zona actual de Robi
     request_id: str = ""
     audio_buffer: bytes = b""
+    pending_face_embedding: str | None = None  # base64 embedding pendiente de asociar
 
     logger.info("ws: sesión iniciada session_id=%s", session_id)
 
@@ -127,13 +159,15 @@ async def ws_interact(websocket: WebSocket) -> None:
             client_type = msg.get("type", "")
 
             if client_type == "interaction_start":
-                user_id = msg.get("user_id", "unknown")
+                person_id = msg.get("person_id") or None
                 request_id = msg.get("request_id") or new_session_id()
                 audio_buffer = b""  # limpiar buffer de interacción anterior
+                pending_face_embedding = msg.get("face_embedding") or None
                 logger.debug(
-                    "ws: interaction_start user_id=%s request_id=%s",
-                    user_id,
+                    "ws: interaction_start person_id=%s request_id=%s has_embedding=%s",
+                    person_id,
                     request_id,
+                    pending_face_embedding is not None,
                 )
 
             elif client_type == "text":
@@ -142,17 +176,21 @@ async def ws_interact(websocket: WebSocket) -> None:
                     request_id = msg.get("request_id") or new_session_id()
                 else:
                     request_id = msg.get("request_id") or request_id
+                face_emb = msg.get("face_embedding") or pending_face_embedding
+                pending_face_embedding = None
 
                 if user_input:
                     await _process_interaction(
                         websocket=websocket,
-                        user_id=user_id,
+                        person_id=person_id,
                         request_id=request_id,
                         user_input=user_input,
                         input_type="text",
                         history_service=history_service,
                         session_id=session_id,
                         agent=agent,
+                        face_embedding_b64=face_emb,
+                        current_zone=current_zone,
                     )
 
             elif client_type == "audio_end":
@@ -160,15 +198,15 @@ async def ws_interact(websocket: WebSocket) -> None:
                     request_id = msg.get("request_id") or new_session_id()
                 else:
                     request_id = msg.get("request_id") or request_id
+                face_emb = msg.get("face_embedding") or pending_face_embedding
+                pending_face_embedding = None
 
-                # El audio se procesa si hay datos; por ahora usamos
-                # un placeholder ya que el pipeline STT se añadirá posteriormente.
                 if audio_buffer:
                     audio_data = audio_buffer
                     audio_buffer = b""
                     await _process_interaction(
                         websocket=websocket,
-                        user_id=user_id,
+                        person_id=person_id,
                         request_id=request_id,
                         user_input=None,
                         input_type="audio",
@@ -176,6 +214,8 @@ async def ws_interact(websocket: WebSocket) -> None:
                         history_service=history_service,
                         session_id=session_id,
                         agent=agent,
+                        face_embedding_b64=face_emb,
+                        current_zone=current_zone,
                     )
                 else:
                     await _send_safe(
@@ -189,12 +229,10 @@ async def ws_interact(websocket: WebSocket) -> None:
                     )
 
             elif client_type == "image":
-                # Multimodal: imagen de contexto o registro — se envía directo a Gemini
                 if not request_id:
                     request_id = msg.get("request_id") or new_session_id()
                 else:
                     request_id = msg.get("request_id") or request_id
-                # Decodificar los bytes de imagen del campo base64
                 raw_b64 = msg.get("data", "")
                 image_bytes: bytes | None = None
                 if raw_b64:
@@ -202,11 +240,12 @@ async def ws_interact(websocket: WebSocket) -> None:
                         image_bytes = base64.b64decode(raw_b64)
                     except Exception:
                         image_bytes = None
-                # Texto opcional enviado junto a la imagen (multimodal texto+imagen)
                 inline_text: str | None = msg.get("text") or None
+                face_emb = msg.get("face_embedding") or pending_face_embedding
+                pending_face_embedding = None
                 await _process_interaction(
                     websocket=websocket,
-                    user_id=user_id,
+                    person_id=person_id,
                     request_id=request_id,
                     user_input=inline_text,
                     input_type="vision",
@@ -214,6 +253,8 @@ async def ws_interact(websocket: WebSocket) -> None:
                     history_service=history_service,
                     session_id=session_id,
                     agent=agent,
+                    face_embedding_b64=face_emb,
+                    current_zone=current_zone,
                 )
 
             elif client_type == "video":
@@ -221,7 +262,6 @@ async def ws_interact(websocket: WebSocket) -> None:
                     request_id = msg.get("request_id") or new_session_id()
                 else:
                     request_id = msg.get("request_id") or request_id
-                # Decodificar los bytes de video del campo base64
                 raw_b64 = msg.get("data", "")
                 video_bytes: bytes | None = None
                 if raw_b64:
@@ -229,11 +269,10 @@ async def ws_interact(websocket: WebSocket) -> None:
                         video_bytes = base64.b64decode(raw_b64)
                     except Exception:
                         video_bytes = None
-                # Texto opcional enviado junto al video (multimodal texto+video)
                 inline_text_v: str | None = msg.get("text") or None
                 await _process_interaction(
                     websocket=websocket,
-                    user_id=user_id,
+                    person_id=person_id,
                     request_id=request_id,
                     user_input=inline_text_v,
                     input_type="vision",
@@ -241,10 +280,10 @@ async def ws_interact(websocket: WebSocket) -> None:
                     history_service=history_service,
                     session_id=session_id,
                     agent=agent,
+                    current_zone=current_zone,
                 )
 
             elif client_type == "multimodal":
-                # Mensaje único con cualquier combinación de texto + audio + imagen + video
                 if not request_id:
                     request_id = msg.get("request_id") or new_session_id()
                 else:
@@ -266,6 +305,8 @@ async def ws_interact(websocket: WebSocket) -> None:
                 mm_audio_mime: str = msg.get("audio_mime", "audio/webm")
                 mm_image_mime: str = msg.get("image_mime", "image/jpeg")
                 mm_video_mime: str = msg.get("video_mime", "video/mp4")
+                face_emb_mm = msg.get("face_embedding") or pending_face_embedding
+                pending_face_embedding = None
 
                 input_type_mm = (
                     "vision"
@@ -274,7 +315,7 @@ async def ws_interact(websocket: WebSocket) -> None:
                 )
                 await _process_interaction(
                     websocket=websocket,
-                    user_id=user_id,
+                    person_id=person_id,
                     request_id=request_id,
                     user_input=mm_text,
                     input_type=input_type_mm,
@@ -287,7 +328,117 @@ async def ws_interact(websocket: WebSocket) -> None:
                     history_service=history_service,
                     session_id=session_id,
                     agent=agent,
+                    face_embedding_b64=face_emb_mm,
+                    current_zone=current_zone,
                 )
+
+            # ── Mensajes nuevos v2.0 ───────────────────────────────────────────
+
+            elif client_type == "explore_mode":
+                # Android indica que Robi entra en modo exploración autónoma.
+                # El agente genera speech + acciones a partir de la zona actual.
+                req_id = msg.get("request_id") or new_session_id()
+                duration = msg.get("duration_minutes", 5)
+                explore_input = (
+                    f"Entra en modo exploración autónoma. Tienes {duration} minutos "
+                    f"para explorar y descubrir zonas nuevas de la casa. "
+                    f"Genera un texto curioso de lo que vas a explorar y sugiere "
+                    f"acciones de movimiento en el tag [actions:]."
+                )
+                context = await _load_robi_context(person_id)
+                explore_full = ""
+                explore_actions: list[dict] = []
+                async for chunk in run_agent_stream(
+                    user_input=explore_input,
+                    history=[],
+                    session_id=session_id,
+                    person_id=person_id,
+                    agent=agent,
+                    memory_context=context,
+                    current_zone=current_zone,
+                ):
+                    explore_full += chunk
+                # Extraer acciones del texto generado
+                _, remaining_exp = parse_emotion_tag(explore_full)
+                _, remaining_exp = parse_emojis_tag(remaining_exp)
+                e_steps, remaining_exp = parse_actions_tag(remaining_exp)
+                if e_steps:
+                    explore_actions = [build_move_sequence("Exploración", e_steps)]
+                await _send_safe(
+                    websocket,
+                    make_exploration_actions(
+                        request_id=req_id,
+                        actions=explore_actions,
+                        exploration_speech=remaining_exp.strip(),
+                    ),
+                )
+
+            elif client_type == "face_scan_mode":
+                # Android inicia escaneo facial activo — Robi gira con secuencia predefinida.
+                req_id = msg.get("request_id") or new_session_id()
+                scan_seq = [build_move_sequence("Escaneo facial", _FACE_SCAN_SEQUENCE)]
+                await _send_safe(
+                    websocket,
+                    make_face_scan_actions(request_id=req_id, actions=scan_seq),
+                )
+
+            elif client_type == "zone_update":
+                # Android informa de la zona actual de Robi.
+                req_id = msg.get("request_id") or new_session_id()
+                zone_name = msg.get("zone_name", "")
+                category = msg.get("category", "unknown")
+                action = msg.get("action", "enter")  # enter | leave | discover
+                if zone_name:
+                    if action in ("enter", "discover"):
+                        current_zone = zone_name
+                    elif action == "leave":
+                        current_zone = None
+                    asyncio.create_task(
+                        _save_zone_bg(
+                            zone_name=zone_name, category=category, action=action
+                        ),
+                        name=f"zone-{req_id}",
+                    )
+                logger.info(
+                    "ws: zone_update zone=%s action=%s session=%s",
+                    zone_name,
+                    action,
+                    session_id,
+                )
+
+            elif client_type == "person_detected":
+                # Android informa de una persona detectada.
+                req_id = msg.get("request_id") or new_session_id()
+                known = msg.get("known", False)
+                detected_pid = msg.get("person_id") or None
+                confidence = msg.get("confidence", 0.0)
+                if known and detected_pid:
+                    person_id = detected_pid
+                    logger.info(
+                        "ws: persona conocida detectada person_id=%s conf=%.2f session=%s",
+                        person_id,
+                        confidence,
+                        session_id,
+                    )
+                else:
+                    # Cara desconocida: Robi debe preguntar el nombre
+                    context = await _load_robi_context(None)
+                    ask_input = (
+                        "Acabo de detectar a una persona que no conozco. "
+                        "Salúdala con curiosidad y pregúntale su nombre de forma amigable."
+                    )
+                    await _process_interaction(
+                        websocket=websocket,
+                        person_id=None,
+                        request_id=req_id,
+                        user_input=ask_input,
+                        input_type="text",
+                        history_service=history_service,
+                        session_id=session_id,
+                        agent=agent,
+                        memory_context=context,
+                        current_zone=current_zone,
+                    )
 
     except Exception as exc:
         logger.error(
@@ -312,7 +463,7 @@ async def ws_interact(websocket: WebSocket) -> None:
 async def _process_interaction(
     *,
     websocket: WebSocket,
-    user_id: str,
+    person_id: str | None,
     request_id: str,
     user_input: str | None,
     input_type: str,  # "text" | "audio" | "vision"
@@ -325,18 +476,20 @@ async def _process_interaction(
     image_mime_type: str = "image/jpeg",
     video_data: bytes | None = None,
     video_mime_type: str = "video/mp4",
+    face_embedding_b64: str | None = None,
+    memory_context: dict | None = None,
+    current_zone: str | None = None,
 ) -> None:
     """
     Procesa una interacción completa:
-      load memory → run agent stream → emit emotion + text_chunks → emit meta
-
-    Para interacciones de audio/imagen/video el contenido media se envía directamente
-    a Gemini que actúa como STT+LLM sin pipeline STT intermedio (§3.4, §1.3).
+      load context → run agent stream → emit emotion + text_chunks
+      → extract tags (memory/person_name/zone_learn) → emit meta
     """
     start_time = time.monotonic()
 
-    # 1. Cargar memoria del usuario
-    memories = await _load_memories(user_id)
+    # 1. Cargar contexto de memorias (si no se pasó ya)
+    if memory_context is None:
+        memory_context = await _load_robi_context(person_id)
 
     # 2. Obtener historial de la sesión
     history = history_service.get_history(session_id)
@@ -348,46 +501,32 @@ async def _process_interaction(
     has_media = (
         audio_data is not None or image_data is not None or video_data is not None
     )
+    has_face_embedding = face_embedding_b64 is not None
 
     if has_media:
         enriched_input: str | None = None
-        memory_context = _build_memory_context(memories)
-        # Si el usuario envió texto junto al media (p.ej. "¿qué ves?"),
-        # añadirlo como contexto para que Gemini lo reciba junto a la imagen/audio.
         if user_input:
-            user_text_part = f"Mensaje del usuario: {user_input}"
-            memory_context = (
-                f"{memory_context}\n\n{user_text_part}".strip()
-                if memory_context
-                else user_text_part
-            )
+            enriched_input = user_input  # texto adicional junto al media
     else:
-        enriched_input = _build_context_input(user_input or "", memories)
-        memory_context = ""
+        enriched_input = user_input or ""
 
     # 4. Streaming del agente
     full_response = ""
     emotion_tag = "neutral"
     emotion_sent = False
     prefix_buf = ""
-    contextual_emojis: list[
-        str
-    ] = []  # códigos OpenMoji del tema (sugeridos por el LLM)
-    response_actions: list[
-        dict
-    ] = []  # acciones físicas del robot (sugeridas por el LLM)
-
-    # El LLM emite [media_summary: ...] AL FINAL de su respuesta.
-    # Usamos pending_buf para detectar el tag aunque llegue fragmentado entre chunks.
+    contextual_emojis: list[str] = []
+    response_actions: list[dict] = []
     media_summary: str = ""
     pending_buf: str = ""
+    extracted_person_name: str | None = None  # de [person_name:NOMBRE]
 
     try:
         async for chunk in run_agent_stream(
             user_input=enriched_input,
             history=history,
             session_id=session_id,
-            user_id=user_id,
+            person_id=person_id,
             agent=agent,
             audio_data=audio_data,
             audio_mime_type=audio_mime_type,
@@ -396,6 +535,8 @@ async def _process_interaction(
             video_data=video_data,
             video_mime_type=video_mime_type,
             memory_context=memory_context,
+            current_zone=current_zone,
+            has_face_embedding=has_face_embedding,
         ):
             if not chunk:
                 continue
@@ -459,7 +600,7 @@ async def _process_interaction(
                     make_emotion(
                         request_id=request_id,
                         emotion=emotion_tag,
-                        user_identified=user_id if user_id != "unknown" else None,
+                        person_identified=person_id,
                     ),
                 )
                 emotion_sent = True
@@ -537,13 +678,13 @@ async def _process_interaction(
             make_emotion(
                 request_id=request_id,
                 emotion=emotion_tag,
-                user_identified=user_id if user_id != "unknown" else None,
+                person_identified=person_id,
             ),
         )
         if full_response:
             await _send_safe(websocket, make_text_chunk(request_id, full_response))
 
-    # Flush del pending_buf al finalizar el stream — extrae [media_summary:...] si está ahí
+    # Flush del pending_buf al finalizar el stream
     if pending_buf:
         match = re.search(
             r"\[media_summary:\s*(.*?)\]", pending_buf, re.DOTALL | re.IGNORECASE
@@ -562,6 +703,52 @@ async def _process_interaction(
             await _send_safe(websocket, make_text_chunk(request_id, clean))
             full_response += clean
         pending_buf = ""
+
+    # ── Extraer tags finales del LLM del full_response ────────────────────────
+    # [person_name:NOMBRE]
+    pn_match = _PERSON_NAME_TAG_RE.search(full_response)
+    if pn_match:
+        extracted_person_name = pn_match.group(1).strip()
+        full_response = _PERSON_NAME_TAG_RE.sub("", full_response).strip()
+        if has_face_embedding and face_embedding_b64 and extracted_person_name:
+            asyncio.create_task(
+                _save_person_name_bg(
+                    name=extracted_person_name,
+                    person_id=person_id,
+                    face_embedding_b64=face_embedding_b64,
+                ),
+                name=f"person-{request_id}",
+            )
+
+    # [memory:TIPO:contenido]
+    for mem_match in _MEMORY_TAG_RE.finditer(full_response):
+        mem_type = mem_match.group(1).strip()
+        mem_content = mem_match.group(2).strip()
+        asyncio.create_task(
+            _save_memory_bg(
+                memory_type=mem_type,
+                content=mem_content,
+                person_id=person_id,
+            ),
+            name=f"memory-{request_id}",
+        )
+    full_response = _MEMORY_TAG_RE.sub("", full_response).strip()
+
+    # [zone_learn:NOMBRE:CATEGORIA:descripción]
+    for zl_match in _ZONE_LEARN_TAG_RE.finditer(full_response):
+        zl_name = zl_match.group(1).strip()
+        zl_cat = zl_match.group(2).strip()
+        zl_desc = zl_match.group(3).strip()
+        asyncio.create_task(
+            _save_zone_bg(
+                zone_name=zl_name,
+                category=zl_cat,
+                action="discover",
+                description=zl_desc,
+            ),
+            name=f"zone-learn-{request_id}",
+        )
+    full_response = _ZONE_LEARN_TAG_RE.sub("", full_response).strip()
     intent = classify_intent(full_response)
     if intent == "photo_request":
         await _send_safe(websocket, make_capture_request(request_id, "photo"))
@@ -592,6 +779,7 @@ async def _process_interaction(
             response_text=full_response,
             emojis=emojis,
             actions=actions,
+            person_name=extracted_person_name,
         ),
     )
 
@@ -622,18 +810,15 @@ async def _process_interaction(
             session_id=session_id,
             user_message=history_user_msg,
             assistant_message=full_response,
+            person_id=person_id,
         )
     )
 
-    # 9. Background: guardar interacción en BD (solo usuarios registrados)
-    if user_id != "unknown":
-        asyncio.create_task(
-            _save_interaction_bg(
-                user_id=user_id,
-                input_type=input_type,
-                summary=full_response[:500],
-            )
-        )
+    # 9. Background: compactación de memorias
+    asyncio.create_task(
+        compact_memories_async(person_id=person_id),
+        name=f"compact-{session_id}",
+    )
 
 
 # ── Background tasks ──────────────────────────────────────────────────────────
@@ -644,10 +829,13 @@ async def _save_history_bg(
     session_id: str,
     user_message: str,
     assistant_message: str,
+    person_id: str | None = None,
 ) -> None:
     """Guarda los mensajes de la interacción en el historial y compacta si es necesario."""
     try:
-        await history_service.add_message(session_id, "user", user_message)
+        await history_service.add_message(
+            session_id, "user", user_message, person_id=person_id
+        )
         await history_service.add_message(session_id, "assistant", assistant_message)
         await history_service.compact_if_needed(session_id)
     except Exception as exc:
@@ -656,68 +844,96 @@ async def _save_history_bg(
         )
 
 
-async def _save_interaction_bg(
-    user_id: str,
-    input_type: str,
-    summary: str,
+async def _save_memory_bg(
+    memory_type: str,
+    content: str,
+    person_id: str | None = None,
+    zone_id: int | None = None,
 ) -> None:
-    """Guarda la interacción en la tabla interactions (solo usuarios registrados)."""
+    """Persiste una memoria extraída del tag [memory:TIPO:contenido] en background."""
     if db_module.AsyncSessionLocal is None:
         return
     try:
         async with db_module.AsyncSessionLocal() as session:
-            row = InteractionRow(
-                user_id=user_id,
-                request_type=input_type,
-                summary=summary,
-                timestamp=datetime.now(timezone.utc),
+            repo = MemoryRepository(session)
+            await repo.save(
+                memory_type=memory_type,
+                content=content,
+                person_id=person_id,
+                zone_id=zone_id,
             )
-            session.add(row)
             await session.commit()
     except Exception as exc:
-        logger.warning("ws: error guardando interacción user_id=%s: %s", user_id, exc)
+        logger.warning("ws: error guardando memoria type=%s: %s", memory_type, exc)
+
+
+async def _save_person_name_bg(
+    name: str,
+    person_id: str | None,
+    face_embedding_b64: str,
+) -> None:
+    """
+    Registra (o actualiza) la persona en la BD y guarda su embedding facial.
+    Llamado cuando el LLM emite [person_name:NOMBRE] junto a un face_embedding.
+    """
+    if db_module.AsyncSessionLocal is None:
+        return
+    try:
+        slug = (
+            person_id
+            or f"persona_{name.lower().replace(' ', '_')[:20]}_{id(name) % 10000:04d}"
+        )
+        embedding_bytes = base64.b64decode(face_embedding_b64)
+        async with db_module.AsyncSessionLocal() as session:
+            people_repo = PeopleRepository(session)
+            person, created = await people_repo.get_or_create(slug, name)
+            if not created and person.name != name:
+                await people_repo.update_name(slug, name)
+            await people_repo.add_embedding(slug, embedding_bytes)
+            await session.commit()
+        logger.info("ws: persona registrada person_id=%s name=%s", slug, name)
+    except Exception as exc:
+        logger.warning("ws: error registrando persona name=%s: %s", name, exc)
+
+
+async def _save_zone_bg(
+    zone_name: str,
+    category: str,
+    action: str,
+    description: str = "",
+) -> None:
+    """Crea o actualiza una zona del mapa mental en background."""
+    if db_module.AsyncSessionLocal is None:
+        return
+    try:
+        async with db_module.AsyncSessionLocal() as session:
+            zones_repo = ZonesRepository(session)
+            zone, _ = await zones_repo.get_or_create(zone_name, category, description)
+            if description and not zone.description and zone.id is not None:
+                await zones_repo.update(
+                    zone.id, description=description, category=category
+                )
+            if action == "enter" and zone.id is not None:
+                await zones_repo.set_current_zone(zone.id)
+            await session.commit()
+    except Exception as exc:
+        logger.warning("ws: error guardando zona zone=%s: %s", zone_name, exc)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-async def _load_memories(user_id: str) -> list:
-    """Carga las memorias más importantes del usuario desde la BD."""
-    if user_id == "unknown" or db_module.AsyncSessionLocal is None:
-        return []
+async def _load_robi_context(person_id: str | None) -> dict:
+    """Carga el contexto de memorias de Robi desde la BD (general + persona + zonas)."""
+    if db_module.AsyncSessionLocal is None:
+        return {}
     try:
         async with db_module.AsyncSessionLocal() as session:
             repo = MemoryRepository(session)
-            return await repo.get_recent_important(user_id, min_importance=5, limit=5)
+            return await repo.get_robi_context(person_id=person_id)
     except Exception as exc:
-        logger.warning("ws: error cargando memoria user_id=%s: %s", user_id, exc)
-        return []
-
-
-def _build_context_input(user_input: str, memories: list) -> str:
-    """
-    Añade el contexto de memorias del usuario al input antes de enviarlo al agente.
-    Si no hay memorias, devuelve el input sin modificar.
-    """
-    if not memories:
-        return user_input
-    memory_lines = [f"- {m.content}" for m in memories]
-    memory_block = "\n".join(memory_lines)
-    return f"[Contexto del usuario:\n{memory_block}\n]\n\n{user_input}"
-
-
-def _build_memory_context(memories: list) -> str:
-    """
-    Devuelve solo el bloque de contexto de memoria como string.
-    Se usa en interacciones multimodal (audio/imagen/video) donde el input
-    del usuario son bytes y el contexto se pasa como texto separado.
-    Si no hay memorias, devuelve cadena vacía.
-    """
-    if not memories:
-        return ""
-    memory_lines = [f"- {m.content}" for m in memories]
-    memory_block = "\n".join(memory_lines)
-    return f"[Contexto del usuario:\n{memory_block}\n]"
+        logger.warning("ws: error cargando contexto person_id=%s: %s", person_id, exc)
+        return {}
 
 
 async def _send_safe(websocket: WebSocket, text: str) -> None:

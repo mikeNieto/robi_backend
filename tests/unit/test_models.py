@@ -1,11 +1,12 @@
 """
-Tests unitarios — Paso 1: Modelos + Base de Datos
+Tests unitarios v2.0 — Modelos + Base de Datos
 
 Cubre:
-  - Serialización / validación de modelos Pydantic (requests, responses, ws_messages)
+  - Entidades de dominio v2.0 (Person, FaceEmbedding, Zone, ZonePath, Memory)
+  - Modelos Pydantic WS messages v2.0 (client + server)
+  - Modelos Pydantic responses (RestoreResponse, HealthResponse, ErrorResponse)
   - Creación de tablas SQLAlchemy con SQLite in-memory
-  - Constraints básicos (unique, nullable, foreign key)
-  - Dataclasses de dominio (entities)
+  - Constraints (unique, nullable, foreign key)
 """
 
 import json
@@ -15,32 +16,50 @@ from datetime import datetime
 
 from db import (
     ConversationHistoryRow,
-    InteractionRow,
+    FaceEmbeddingRow,
     MemoryRow,
-    UserRow,
+    PersonRow,
+    ZoneRow,
+    ZonePathRow,
     create_all_tables,
     drop_all_tables,
     init_db,
 )
-from models.entities import ConversationMessage, Interaction, Memory, User
-from models.requests import FaceRegisterRequest, MemorySaveRequest
+from models.entities import (
+    ConversationMessage,
+    Memory,
+    Person,
+    Zone,
+    ZonePath,
+    ZONE_CATEGORIES,
+    MEMORY_TYPES,
+)
 from models.responses import (
     ErrorResponse,
     HealthResponse,
-    MemoryItemResponse,
-    UserResponse,
+    RestoreMemoryResponse,
+    RestorePersonResponse,
+    RestoreResponse,
+    RestoreZonePathResponse,
+    RestoreZoneResponse,
 )
 from models.ws_messages import (
     AudioEndMessage,
     AuthMessage,
     AuthOkMessage,
     EmotionMessage,
+    ExploreModeMessage,
+    ExpressionPayload,
+    FaceScanModeMessage,
     InteractionStartMessage,
+    LowBatteryAlertMessage,
+    PersonDetectedMessage,
     ResponseMetaMessage,
     StreamEndMessage,
     TextChunkMessage,
     TextMessage,
     WsErrorMessage,
+    ZoneUpdateMessage,
 )
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -70,75 +89,66 @@ async def db_session():
 
 
 class TestEntities:
-    def test_user_defaults(self):
-        u = User(user_id="user_juan_1", name="Juan")
-        assert u.face_embedding is None
-        assert u.preferences == {}
-        assert u.id is None
-        assert isinstance(u.created_at, datetime)
+    def test_person_defaults(self):
+        p = Person(person_id="persona_ana_001", name="Ana")
+        assert p.id is None
+        assert p.interaction_count == 0
+        assert p.notes == ""
+        assert isinstance(p.first_seen, datetime)
+        assert isinstance(p.last_seen, datetime)
 
-    def test_memory_defaults(self):
-        m = Memory(
-            user_id="user_juan_1", memory_type="fact", content="Le gusta el café"
-        )
+    def test_memory_defaults_v2(self):
+        m = Memory(memory_type="general", content="Hay un gato en casa")
+        assert m.person_id is None
+        assert m.zone_id is None
         assert m.importance == 5
         assert m.expires_at is None
 
-    def test_interaction_defaults(self):
-        i = Interaction(
-            user_id="user_juan_1", request_type="audio", summary="Preguntó la hora"
+    def test_memory_with_person(self):
+        m = Memory(
+            memory_type="person_fact",
+            content="Ana le gusta el café",
+            person_id="persona_ana_001",
+            importance=7,
         )
-        assert isinstance(i.timestamp, datetime)
+        assert m.person_id == "persona_ana_001"
+
+    def test_zone_defaults(self):
+        z = Zone(name="sala", category="living_area")
+        assert z.accessible is True
+        assert z.current_robi_zone is False
+        assert z.description == ""
+
+    def test_zone_path_fields(self):
+        zp = ZonePath(from_zone_id=1, to_zone_id=2, direction_hint="norte")
+        assert zp.distance_cm is None
 
     def test_conversation_message_defaults(self):
         msg = ConversationMessage(session_id="sess-1", role="user", content="Hola")
         assert msg.is_compacted is False
         assert msg.message_index == 0
 
+    def test_zone_categories_constant(self):
+        assert "living_area" in ZONE_CATEGORIES
+        assert "bedroom" in ZONE_CATEGORIES
 
-# ═══════════════════════════════════════════════════════
-# Modelos Pydantic — Requests
-# ═══════════════════════════════════════════════════════
-
-
-class TestRequestModels:
-    def test_face_register_valid(self):
-        req = FaceRegisterRequest(
-            user_id="user_juan_1",
-            name="Juan",
-            embedding_b64="abc123==",
-        )
-        assert req.user_id == "user_juan_1"
-
-    def test_face_register_empty_user_id_fails(self):
-        with pytest.raises(Exception):
-            FaceRegisterRequest(user_id="", name="Juan", embedding_b64="abc")
-
-    def test_memory_save_valid(self):
-        req = MemorySaveRequest(
-            memory_type="preference", content="Le gusta el café", importance=8
-        )
-        assert req.importance == 8
-
-    def test_memory_save_invalid_type(self):
-        with pytest.raises(Exception):
-            MemorySaveRequest(memory_type="secret", content="Contraseña", importance=5)
-
-    def test_memory_save_importance_out_of_range(self):
-        with pytest.raises(Exception):
-            MemorySaveRequest(memory_type="fact", content="x", importance=11)
+    def test_memory_types_constant(self):
+        assert "general" in MEMORY_TYPES
+        assert "person_fact" in MEMORY_TYPES
+        assert "zone_info" in MEMORY_TYPES
+        assert "experience" in MEMORY_TYPES
 
 
 # ═══════════════════════════════════════════════════════
-# Modelos Pydantic — Responses
+# Modelos Pydantic — Responses v2.0
 # ═══════════════════════════════════════════════════════
 
 
 class TestResponseModels:
-    def test_health_response_defaults(self):
+    def test_health_response_version_2(self):
         r = HealthResponse()
         assert r.status == "ok"
-        assert r.version == "1.4"
+        assert r.version == "2.0"
 
     def test_error_response_serializes(self):
         err = ErrorResponse(
@@ -153,25 +163,49 @@ class TestResponseModels:
         assert data["error_code"] == "GEMINI_TIMEOUT"
         assert data["retry_after"] == 5
 
-    def test_user_response_serializes(self):
-        u = UserResponse(
-            user_id="user_juan_1",
-            name="Juan",
-            created_at="2026-01-01T00:00:00Z",
-            last_seen="2026-02-20T10:00:00Z",
-            has_face_embedding=True,
+    def test_restore_person_response(self):
+        r = RestorePersonResponse(
+            person_id="persona_ana_001",
+            name="Ana",
+            first_seen=datetime(2026, 1, 1),
+            last_seen=datetime(2026, 2, 1),
+            interaction_count=10,
+            notes="Le gusta el café",
+            face_embeddings=["abc==", "def=="],
         )
-        assert u.has_face_embedding is True
+        assert len(r.face_embeddings) == 2
 
-    def test_memory_item_importance_bounds(self):
-        with pytest.raises(Exception):
-            MemoryItemResponse(
-                id=1,
-                memory_type="fact",
-                content="x",
-                importance=0,
-                timestamp="2026-01-01T00:00:00Z",
-            )
+    def test_restore_zone_response(self):
+        path = RestoreZonePathResponse(to_zone_id=2, direction_hint="norte")
+        zone = RestoreZoneResponse(
+            id=1,
+            name="sala",
+            category="living_area",
+            known_since=datetime(2026, 1, 1),
+            accessible=True,
+            is_current=True,
+            paths=[path],
+        )
+        assert zone.is_current is True
+        assert len(zone.paths) == 1
+
+    def test_restore_memory_response(self):
+        m = RestoreMemoryResponse(
+            id=5,
+            memory_type="general",
+            content="La casa tiene 3 habitaciones",
+            importance=6,
+            created_at=datetime(2026, 1, 1),
+        )
+        assert m.person_id is None
+        assert m.zone_id is None
+
+    def test_restore_response_full(self):
+        r = RestoreResponse(people=[], zones=[], general_memories=[])
+        data = json.loads(r.model_dump_json())
+        assert "people" in data
+        assert "zones" in data
+        assert "general_memories" in data
 
 
 # ═══════════════════════════════════════════════════════
@@ -184,31 +218,102 @@ class TestWsClientMessages:
         msg = AuthMessage(type="auth", api_key="secret", device_id="dev-1")
         assert msg.type == "auth"
 
-    def test_interaction_start_unknown_user(self):
+    def test_interaction_start_with_person_id(self):
         msg = InteractionStartMessage(
             type="interaction_start",
             request_id="req-1",
-            user_id="unknown",
-            face_recognized=False,
+            person_id="persona_ana_001",
         )
-        assert msg.face_confidence is None
+        assert msg.person_id == "persona_ana_001"
+        assert msg.face_embedding is None
 
-    def test_audio_end(self):
-        msg = AudioEndMessage(type="audio_end", request_id="req-1")
-        assert msg.request_id == "req-1"
+    def test_interaction_start_with_embedding(self):
+        msg = InteractionStartMessage(
+            type="interaction_start",
+            request_id="req-1",
+            face_embedding="abc123==",
+        )
+        assert msg.face_embedding == "abc123=="
 
-    def test_text_message(self):
+    def test_interaction_start_anon(self):
+        msg = InteractionStartMessage(
+            type="interaction_start",
+            request_id="req-1",
+        )
+        assert msg.person_id is None
+
+    def test_audio_end_with_face_embedding(self):
+        msg = AudioEndMessage(
+            type="audio_end",
+            request_id="req-1",
+            face_embedding="xyz==",
+        )
+        assert msg.face_embedding == "xyz=="
+
+    def test_text_message_no_embedding(self):
         msg = TextMessage(type="text", request_id="req-2", content="¿Qué hora es?")
-        assert msg.content == "¿Qué hora es?"
+        assert msg.face_embedding is None
 
-    def test_discriminated_union_auth(self):
-        """Pydantic puede parsear el tipo correcto a partir del campo type."""
-        from pydantic import TypeAdapter
+    def test_explore_mode_message(self):
+        msg = ExploreModeMessage(
+            type="explore_mode",
+            request_id="req-3",
+            duration_minutes=10,
+        )
+        assert 1 <= msg.duration_minutes <= 60
 
-        ta = TypeAdapter(AuthMessage | InteractionStartMessage | AudioEndMessage)
-        raw = {"type": "auth", "api_key": "k", "device_id": "d"}
-        parsed = ta.validate_python(raw)
-        assert isinstance(parsed, AuthMessage)
+    def test_explore_mode_bounds(self):
+        with pytest.raises(Exception):
+            ExploreModeMessage(
+                type="explore_mode", request_id="req", duration_minutes=0
+            )
+        with pytest.raises(Exception):
+            ExploreModeMessage(
+                type="explore_mode", request_id="req", duration_minutes=61
+            )
+
+    def test_face_scan_mode_message(self):
+        msg = FaceScanModeMessage(type="face_scan_mode", request_id="req-4")
+        assert msg.type == "face_scan_mode"
+
+    def test_zone_update_message(self):
+        msg = ZoneUpdateMessage(
+            type="zone_update",
+            request_id="req-5",
+            zone_name="cocina",
+            category="kitchen",
+            action="enter",
+        )
+        assert msg.action == "enter"
+
+    def test_zone_update_invalid_action(self):
+        with pytest.raises(Exception):
+            ZoneUpdateMessage(
+                type="zone_update",
+                request_id="req",
+                zone_name="sala",
+                action="fly",  # type: ignore[arg-type]
+            )
+
+    def test_person_detected_known(self):
+        msg = PersonDetectedMessage(
+            type="person_detected",
+            request_id="req-6",
+            known=True,
+            person_id="persona_ana_001",
+            confidence=0.92,
+        )
+        assert msg.known is True
+        assert msg.confidence == 0.92
+
+    def test_person_detected_unknown(self):
+        msg = PersonDetectedMessage(
+            type="person_detected",
+            request_id="req-7",
+            known=False,
+            confidence=0.0,
+        )
+        assert msg.person_id is None
 
 
 # ═══════════════════════════════════════════════════════
@@ -219,40 +324,46 @@ class TestWsClientMessages:
 class TestWsServerMessages:
     def test_auth_ok(self):
         msg = AuthOkMessage(session_id="sess-abc")
-        assert msg.type == "auth_ok"
         data = json.loads(msg.model_dump_json())
         assert data["type"] == "auth_ok"
 
-    def test_emotion_message(self):
+    def test_emotion_with_person_identified(self):
         msg = EmotionMessage(
             request_id="req-1",
             emotion="happy",
-            user_identified="user_juan_1",
+            person_identified="persona_ana_001",
             confidence=0.95,
         )
         assert msg.type == "emotion"
+        assert msg.person_identified == "persona_ana_001"
+
+    def test_emotion_no_person(self):
+        msg = EmotionMessage(request_id="req-1", emotion="neutral")
+        assert msg.person_identified is None
 
     def test_text_chunk(self):
-        msg = TextChunkMessage(request_id="req-1", text="Hola Juan, ")
-        assert msg.text == "Hola Juan, "
+        msg = TextChunkMessage(request_id="req-1", text="Hola Ana, ")
+        assert msg.text == "Hola Ana, "
 
-    def test_response_meta_serializes(self):
-        from models.ws_messages import ExpressionPayload
+    def test_response_meta_with_person_name(self):
+        msg = ResponseMetaMessage(
+            request_id="req-1",
+            response_text="¡Hola María!",
+            expression=ExpressionPayload(emojis=["1F44B"]),
+            actions=[],
+            person_name="María",
+        )
+        data = json.loads(msg.model_dump_json())
+        assert data["person_name"] == "María"
 
+    def test_response_meta_person_name_none(self):
         msg = ResponseMetaMessage(
             request_id="req-1",
             response_text="Hola!",
-            expression=ExpressionPayload(emojis=["1F44B", "1F603"]),
-            actions=[
-                {
-                    "type": "move",
-                    "params": {"direction": "forward", "duration_ms": 1000},
-                }
-            ],
+            expression=ExpressionPayload(emojis=[]),
+            actions=[],
         )
-        data = json.loads(msg.model_dump_json())
-        assert data["type"] == "response_meta"
-        assert "1F44B" in data["expression"]["emojis"]
+        assert msg.person_name is None
 
     def test_stream_end(self):
         msg = StreamEndMessage(request_id="req-1", processing_time_ms=820)
@@ -263,6 +374,11 @@ class TestWsServerMessages:
         assert msg.recoverable is False
         assert msg.type == "error"
 
+    def test_low_battery_alert(self):
+        msg = LowBatteryAlertMessage(battery_level=12, source="robot")
+        assert msg.type == "low_battery_alert"
+        assert msg.battery_level == 12
+
 
 # ═══════════════════════════════════════════════════════
 # Base de Datos — creación de tablas y constraints
@@ -271,8 +387,16 @@ class TestWsServerMessages:
 
 @pytest.mark.asyncio
 async def test_tables_created(db_session: AsyncSession):
-    """Las 4 tablas deben existir tras create_all_tables()."""
-    for table in ("users", "memories", "interactions", "conversation_history"):
+    """Las 6 tablas deben existir tras create_all_tables()."""
+    expected = (
+        "people",
+        "face_embeddings",
+        "zones",
+        "zone_paths",
+        "memories",
+        "conversation_history",
+    )
+    for table in expected:
         result = await db_session.execute(
             text(
                 f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"
@@ -282,30 +406,30 @@ async def test_tables_created(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_user_unique_constraint(db_session: AsyncSession):
-    """Insertar dos usuarios con el mismo user_id debe fallar por UNIQUE."""
+async def test_person_unique_constraint(db_session: AsyncSession):
+    """Insertar dos personas con el mismo person_id debe fallar (UNIQUE)."""
     from sqlalchemy.exc import IntegrityError
 
-    u1 = UserRow(user_id="user_dup", name="Dup 1", preferences="{}")
-    u2 = UserRow(user_id="user_dup", name="Dup 2", preferences="{}")
-    db_session.add(u1)
+    p1 = PersonRow(person_id="dup_slug", name="Dup 1")
+    p2 = PersonRow(person_id="dup_slug", name="Dup 2")
+    db_session.add(p1)
     await db_session.flush()
-    db_session.add(u2)
+    db_session.add(p2)
     with pytest.raises(IntegrityError):
         await db_session.flush()
 
 
 @pytest.mark.asyncio
-async def test_insert_user_and_memory(db_session: AsyncSession):
-    user = UserRow(user_id="user_test_1", name="Test User", preferences="{}")
-    db_session.add(user)
+async def test_insert_person_and_memory(db_session: AsyncSession):
+    person = PersonRow(person_id="p_test_1", name="Test")
+    db_session.add(person)
     await db_session.flush()
 
     mem = MemoryRow(
-        user_id="user_test_1",
-        memory_type="fact",
-        content="Le gusta el café",
+        memory_type="person_fact",
+        content="Le gusta el jazz",
         importance=7,
+        person_id="p_test_1",
     )
     db_session.add(mem)
     await db_session.flush()
@@ -313,56 +437,52 @@ async def test_insert_user_and_memory(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_insert_interaction(db_session: AsyncSession):
-    user = UserRow(user_id="user_test_2", name="Another", preferences="{}")
-    db_session.add(user)
+async def test_insert_zone_and_path(db_session: AsyncSession):
+    z1 = ZoneRow(name="sala", category="living_area")
+    z2 = ZoneRow(name="cocina", category="kitchen")
+    db_session.add_all([z1, z2])
     await db_session.flush()
 
-    inter = InteractionRow(
-        user_id="user_test_2",
-        request_type="audio",
-        summary="Preguntó por el clima",
-    )
-    db_session.add(inter)
+    path = ZonePathRow(from_zone_id=z1.id, to_zone_id=z2.id, direction_hint="norte")
+    db_session.add(path)
     await db_session.flush()
-    assert inter.id is not None
+    assert path.id is not None
 
 
 @pytest.mark.asyncio
-async def test_insert_conversation_history(db_session: AsyncSession):
-    row = ConversationHistoryRow(
-        session_id="sess-unit-1",
-        role="user",
-        content="Hola Robi",
-        message_index=0,
-    )
-    db_session.add(row)
-    await db_session.flush()
-    assert row.id is not None
-
-
-@pytest.mark.asyncio
-async def test_memory_importance_nullable_expires(db_session: AsyncSession):
-    """expires_at es nullable; importance tiene default 5."""
-    user = UserRow(user_id="user_test_3", name="Test 3", preferences="{}")
-    db_session.add(user)
-    await db_session.flush()
-
+async def test_memory_nullable_person(db_session: AsyncSession):
+    """person_id es nullable: memoria general sin persona asociada."""
     mem = MemoryRow(
-        user_id="user_test_3", memory_type="preference", content="Prefiere jazz"
+        memory_type="general",
+        content="La casa tiene jardín",
+        importance=5,
     )
     db_session.add(mem)
     await db_session.flush()
-    assert mem.importance == 5
-    assert mem.expires_at is None
+    assert mem.person_id is None
 
 
 @pytest.mark.asyncio
-async def test_conversation_compacted_flag(db_session: AsyncSession):
+async def test_face_embedding_row(db_session: AsyncSession):
+    person = PersonRow(person_id="p_emb_1", name="Embed Test")
+    db_session.add(person)
+    await db_session.flush()
+
+    emb = FaceEmbeddingRow(
+        person_id="p_emb_1",
+        embedding=b"\x01\x02\x03" * 43,
+    )
+    db_session.add(emb)
+    await db_session.flush()
+    assert emb.id is not None
+
+
+@pytest.mark.asyncio
+async def test_conversation_history_compacted(db_session: AsyncSession):
     row = ConversationHistoryRow(
         session_id="sess-compact",
         role="assistant",
-        content="[Resumen: El usuario habló de música y clima]",
+        content="[Resumen compactado]",
         message_index=0,
         is_compacted=True,
     )

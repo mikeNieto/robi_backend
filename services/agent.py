@@ -34,9 +34,9 @@ from collections.abc import AsyncIterator
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-logger = logging.getLogger(__name__)
-
 from services.gemini import get_model
+
+logger = logging.getLogger(__name__)
 
 # ── System Prompt v2.0 — Robi Amigo Familiar ─────────────────────────────────
 
