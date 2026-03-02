@@ -2132,7 +2132,7 @@ esp32-firmware/
 │   │   ├── CliffSensor.h
 │   │   ├── DistanceSensor.cpp      # HC-SR04 x2 (frontal y trasero)
 │   │   ├── DistanceSensor.h
-│   │   └── BatteryMonitor.cpp      # Pack 6x18650 3S2P, 11.1V nominal
+│   │   └── BatteryMonitor.cpp      # Pack 6x18650 2S3P, 7.4V nominal
 │   ├── leds/
 │   │   ├── LEDController.cpp       # RGB LED simple 4 patas, 256 colores
 │   │   └── LEDController.h
@@ -2175,21 +2175,33 @@ Sensores de Cliff — VL53L0X ToF x3 (I²C):
 
 Sensor de Distancia FRONTAL — HC-SR04:
 - Trigger: GPIO 4
-- Echo:    GPIO 5
+- Echo:    GPIO 5  → divisor resistivo: R1=2kΩ (Echo→GPIO), R2=3kΩ (GPIO→GND)
+  HC-SR04 Echo = 5V → V_gpio = 5V × 3k/(2k+3k) = 3.0V  ✅ seguro para ESP32
 
 Sensor de Distancia TRASERO — HC-SR04:
 - Trigger: GPIO 6
-- Echo:    GPIO 7
+- Echo:    GPIO 7  → divisor resistivo: R1=2kΩ (Echo→GPIO), R2=3kΩ (GPIO→GND)
+  HC-SR04 Echo = 5V → V_gpio = 5V × 3k/(2k+3k) = 3.0V  ✅ seguro para ESP32
+
+NOTA CRÍTICA HC-SR04: El módulo HC-SR04 opera a 5V y su pin Echo devuelve 5V.
+  El GPIO del ESP32-S3 soporta máximo 3.3V de entrada. Sin divisor se puede
+  dañar el GPIO con el tiempo. El divisor 2kΩ+3kΩ baja la señal a 3.0V.
+  Resistencias requeridas por sensor: 1× 2kΩ + 1× 3kΩ  (total: 2× 2kΩ + 2× 3kΩ)
 
 RGB LED simple (4 patas, ánodo común, 256 colores por canal → ~16M colores):
-- Canal R:  GPIO 38  (PWM — LEDC canal 0)
-- Canal G:  GPIO 39  (PWM — LEDC canal 1)
-- Canal B:  GPIO 40  (PWM — LEDC canal 2)
+- Canal R:  GPIO 38  (PWM — LEDC canal 0)  → R_serie = 220Ω entre GPIO y cátodo R
+- Canal G:  GPIO 39  (PWM — LEDC canal 1)  → R_serie = 220Ω entre GPIO y cátodo G
+- Canal B:  GPIO 40  (PWM — LEDC canal 2)  → R_serie = 220Ω entre GPIO y cátodo B
 - Ánodo (+): 3.3V  (pata larga — ánodo común)
   Nota: nivel LOW = LED encendido; usar ledcWrite(pin, 255 - valor)
+  Cálculo corriente: I_R = (3.3-2.0)/220 ≈ 6mA | I_G/B = (3.3-3.0)/220 ≈ 1.4mA
+  Resistencias requeridas: 3× 220Ω (una por canal R, G, B)
 
 Batería:
-- Voltaje ADC:  GPIO 8   (divisor resistivo para medir pack 3S2P, ADC1_CH7)
+- Voltaje ADC:  GPIO 8   (divisor resistivo para medir pack 2S3P, ADC1_CH7)
+  Divisor: R_top=82kΩ (batería+→GPIO), R_bot=47kΩ (GPIO→GND)
+  V_gpio = 8.4V × 47k/(82k+47k) = 3.06V  ✅ seguro, alta impedancia = bajo consumo
+  Resolución: ~0.002V por LSB del ADC de 12 bits (rango 0–8.4V sobre 0–3.06V ADC)
 ```
 
 > **Nota de pines**: Todos los conflictos de la revisión anterior han sido resueltos con esta
@@ -2199,20 +2211,24 @@ Batería:
 #### Especificaciones Eléctricas
 
 ```
-Alimentación — Pack 6x 18650 en 3S2P:
-- Configuración: 3S2P → 3 celdas en serie × 2 en paralelo
-- Tensión nominal: 11.1V (3.7V × 3S)
-- Tensión máxima (cargado): 12.6V (4.2V × 3S)
-- Tensión mínima (protección BMS): ~9.0V (3.0V × 3S)
-- Capacidad total: 2 × capacidad de celda (p.ej. 2 × 3000mAh = 6000mAh)
-- BMS: 3S 20A para Li-ion 18650 (protección de sobrecarga, sobredescarga, cortocircuito)
+Alimentación — Pack 6x 18650 en 2S3P:
+- Configuración: 2S3P → 2 celdas en serie × 3 en paralelo
+- Tensión nominal: 7.4V  (3.7V × 2S)
+- Tensión máxima (cargado): 8.4V  (4.2V × 2S)
+- Tensión mínima (protección BMS): ~6.0V (3.0V × 2S)
+- Capacidad total: 3 × capacidad de celda (p.ej. 3 × 3000mAh = 9000mAh)
+- BMS: 2S 20A para Li-ion 18650 (protección de sobrecarga, sobredescarga, cortocircuito)
+- Ventaja vs 3S2P: +50% autonomía con los mismos 6 celdas; menos disipación
+  térmica en el L298N (menor caída ΔV en el buck converter)
 
 Regulación de voltaje — 2 Buck Converters:
-- Buck Converter #1 (Motores): 9–12.6V → 5.0V
+- Buck Converter #1 (Motores): 6.0–8.4V → 5.0V
     Salida: alimenta L298N y Gear Motor TT Yellow
-- Buck Converter #2 (ESP32 + sensores): 9–12.6V → 5.0V
+    Nota: verificar que el buck elegido acepte entrada mínima de 6V
+- Buck Converter #2 (ESP32 + sensores): 6.0–8.4V → 5.0V
     Entrada al pin VIN del ESP32
     Regulador interno ESP32: 5V → 3.3V (para lógica + VL53L0X + HC-SR04)
+    Nota: mismo requisito de entrada mínima 6V
 
 Motores:
 - Tipo: Gear Motor TT Yellow for Arduino Robotic Car
@@ -2222,12 +2238,39 @@ Motores:
 - PWM Frecuencia: 1kHz
 - Número de ruedas: 2 ruedas motrices + 1 rueda de apoyo (soporte)
 
+Circuito divisor de voltaje — Monitoreo batería (GPIO 8 / ADC1_CH7):
+  Bat+ ──── 82kΩ ──── GPIO 8 (ADC)
+                 │
+                47kΩ
+                 │
+                GND
+  V_max_adc = 8.4V × 47k/(82k+47k) = 3.06V  ✅ dentro del rango ESP32 (0–3.3V)
+  Alta impedancia total (129kΩ) = corriente divisor ~65µA (despreciable)
+  Resistencias: 1× 82kΩ + 1× 47kΩ
+
+Circuito divisor de voltaje — HC-SR04 Echo pins (protección GPIO):
+  HC-SR04 Echo (5V) ──── 2kΩ ──── GPIO (ESP32)
+                                │
+                               3kΩ
+                                │
+                               GND
+  V_gpio = 5V × 3k/(2k+3k) = 3.0V  ✅ seguro para GPIO ESP32-S3
+  Se requieren 2 pares (uno por cada HC-SR04): 2× 2kΩ + 2× 3kΩ
+
+Circuito RGB LED — Resistencias de protección (ánodo común a 3.3V):
+  GPIO ──── 220Ω ──── cátodo R/G/B ──── ánodo (+3.3V)
+  I_rojo   = (3.3 - 2.0) / 220 ≈ 5.9mA  ✅
+  I_verde  = (3.3 - 3.0) / 220 ≈ 1.4mA  ✅
+  I_azul   = (3.3 - 3.0) / 220 ≈ 1.4mA  ✅
+  Resistencias: 3× 220Ω (una por canal)
+
 Consumo Total (estimado):
 - ESP32:        ~100mA (BT activo)
 - Motores:      ~400mA (en movimiento)
-- RGB LED:      ~30mA (brillo máximo, 3 canales × 10mA típico)
+- RGB LED:      ~15mA (3 canales activos a 5.9/1.4/1.4mA)
 - Sensores:     ~80mA (2× HC-SR04 + 3× VL53L0X)
-- TOTAL pico:   ~610mA (desde Buck #2) + ~400mA (Buck #1 motores)
+- Divisores:    ~0.1mA (alta impedancia, despreciable)
+- TOTAL pico:   ~595mA (desde Buck #2) + ~400mA (Buck #1 motores)
 ```
 
 ### 5.4 Protocolo BLE
@@ -2612,11 +2655,14 @@ Modo emergencia: Inmediato al detectar condición crítica
 #define DIST_TRIG_REAR  6
 #define DIST_ECHO_REAR  7
 
-// Batería — Pack 6x 18650 3S2P
-#define BATTERY_ADC_PIN  8               // ADC1_CH7 — divisor resistivo 3S2P
+// Batería — Pack 6x 18650 2S3P
+// Divisor resistivo: R_top=82kΩ, R_bot=47kΩ → V_adc_max = 3.06V @ 8.4V batería
+// Factor de escala: V_bat = V_adc × (82k + 47k) / 47k = V_adc × 2.7447
+#define BATTERY_ADC_PIN  8               // ADC1_CH7 — divisor resistivo 2S3P
 #define BATTERY_ADC_SAMPLES 10
-#define BATTERY_VOLTAGE_MIN 9.0          // ~3.0V × 3S (BMS protege antes)
-#define BATTERY_VOLTAGE_MAX 12.6         // 4.2V × 3S (carga completa)
+#define BATTERY_VOLTAGE_MIN 6.0          // ~3.0V × 2S (BMS protege antes)
+#define BATTERY_VOLTAGE_MAX 8.4          // 4.2V × 2S (carga completa)
+#define BATTERY_DIVIDER_RATIO 2.7447f    // (82k+47k)/47k — para convertir V_adc a V_bat
 
 // Motor — Gear Motor TT Yellow 5V via L298N
 #define MOTOR_VOLTAGE_TARGET 5.0         // Buck Converter #1 → 5V
@@ -3498,9 +3544,12 @@ Componentes adicionales:
 - Sensores cliff: 3x VL53L0X ToF (distancia precisa para detección de caídas)
 - Sensores distancia: 2x HC-SR04 ultrasónico (frontal + trasero)
 - LED: RGB LED simple 4 patas (cátodo/ánodo común), 256 colores por canal
-- Batería: 6x 18650 Li-ion en configuración 3S2P = 11.1V nominal
-- BMS: 3S 20A para Li-ion 18650
-- Regulación: 2x Buck Converter (uno para motores a 5V, uno para ESP32+sensores a 5V)
+- Batería: 6x 18650 Li-ion en configuración 2S3P = 7.4V nominal (9000mAh con celdas 3000mAh)
+- BMS: 2S 20A para Li-ion 18650
+- Regulación: 2x Buck Converter 6–8.4V→5V (uno para motores, uno para ESP32+sensores)
+- Resistencias divisor batería: 1× 82kΩ + 1× 47kΩ
+- Resistencias divisor HC-SR04 Echo: 2× 2kΩ + 2× 3kΩ (una pareja por sensor)
+- Resistencias RGB LED: 3× 220Ω (una por canal R, G, B)
 - Interruptor: Power switch
 - Cables y conectores
 ```
@@ -3786,11 +3835,17 @@ facial, expresiones visuales y captura de medios funciona sin el ESP32.
    □ Conectar HC-SR04 FRONTAL (Trigger: GPIO 5, Echo: GPIO 18)
    □ Conectar HC-SR04 TRASERO (Trigger: GPIO 19, Echo: GPIO 21)
    □ Conectar RGB LED 4 patas (R: GPIO 23, G: GPIO 22, B: GPIO 4)
-   □ Conectar BMS 3S al pack de 6x 18650
-   □ Conectar Buck Converter #1 (motores): entrada BMS → 5V salida → L298N
-   □ Conectar Buck Converter #2 (ESP32): entrada BMS → 5V salida → VIN ESP32
+   □ Conectar BMS 2S al pack de 6x 18650 en configuración 2S3P
+   □ Conectar Buck Converter #1 (motores): entrada BMS (6–8.4V) → 5V salida → L298N
+   □ Conectar Buck Converter #2 (ESP32): entrada BMS (6–8.4V) → 5V salida → VIN ESP32
+   □ Instalar divisor resistivo batería en GPIO 8: 82kΩ (bat+→GPIO) + 47kΩ (GPIO→GND)
+   □ Instalar divisores Echo HC-SR04 FRONTAL (GPIO 5): 2kΩ (Echo→GPIO) + 3kΩ (GPIO→GND)
+   □ Instalar divisores Echo HC-SR04 TRASERO (GPIO 7): 2kΩ (Echo→GPIO) + 3kΩ (GPIO→GND)
+   □ Instalar resistencias RGB LED: 220Ω en serie con cada cátodo (R→GPIO38, G→GPIO39, B→GPIO40)
    □ Verificar voltajes con multímetro:
-       Pack cargado: ~12.6V, Buck #1 salida: 5.0V, Buck #2 salida: 5.0V
+       Pack cargado: ~8.4V, Buck #1 salida: 5.0V, Buck #2 salida: 5.0V
+       GPIO 8 (ADC bat): máx ~3.06V con pack lleno (8.4V)
+       GPIO 5/7 (Echo HC-SR04): máx ~3.0V con señal activa
    □ Conectar power switch
    
 4. Calibración:
@@ -4150,5 +4205,5 @@ La implementación debe seguir este documento como guía, ajustando detalles seg
 | 1.1 | 2026-02-08 | Claude | Revisión post-evaluación: arquitectura WebSocket streaming, heartbeat ESP32, emociones dirigidas por LLM, HTTPS obligatorio con certificate pinning |
 | 1.2 | 2026-02-08 | Claude | Flujo de activación y reconocimiento facial on-device (ML Kit + FaceNet TFLite) |
 | 1.3 | 2026-02-18 | Claude | Ajustes: TTS Android nativo (reemplaza Piper/ElevenLabs), LLM migrado a Gemini Flash Lite, LangChain Deep Agents como framework del agente (extensible con MCP/tools/skills), captura de foto/video por comando de voz, system prompt TTS-safe, plan de implementación incremental con pruebas por fase |
-| 1.4 | 2026-02-18 | Claude | Ajustes 1-24: búsqueda persona con rotación ±90° (PERSON_SEARCH_TIMEOUT_MS=8s), solo cámara frontal, escucha continua 60s (CONVERSATION_KEEP_ALIVE_MS), landscape fija + tema oscuro + emoji OpenMoji CDN, control solo por voz, historial con compactación (20 msgs) + filtro privacidad, indicadores batería ≤15%, secuencias de movimiento ESP32 + total_duration_ms, Docker Compose (Nginx+FastAPI), eliminado reconocimiento facial backend, 2 ruedas + apoyo, 2 sensores distancia HC-SR04, RGB LED 4 patas, solo L298N + Gear Motor TT Yellow 5V, VL53L0X ToF cliff, pack 6x18650 3S2P + BMS 3S 20A + 2 buck converters, IP 192.168.2.200:9393, Streamlit simulator, OpenMoji sin ZIP |
+| 1.4 | 2026-02-18 | Claude | Ajustes 1-24: búsqueda persona con rotación ±90° (PERSON_SEARCH_TIMEOUT_MS=8s), solo cámara frontal, escucha continua 60s (CONVERSATION_KEEP_ALIVE_MS), landscape fija + tema oscuro + emoji OpenMoji CDN, control solo por voz, historial con compactación (20 msgs) + filtro privacidad, indicadores batería ≤15%, secuencias de movimiento ESP32 + total_duration_ms, Docker Compose (Nginx+FastAPI), eliminado reconocimiento facial backend, 2 ruedas + apoyo, 2 sensores distancia HC-SR04, RGB LED 4 patas, solo L298N + Gear Motor TT Yellow 5V, VL53L0X ToF cliff, pack 6x18650 2S3P + BMS 2S 20A + 2 buck converters (6–8.4V→5V) + resistencias divisor echo HC-SR04 (2kΩ+3kΩ×2) + divisor batería (82kΩ+47kΩ) + resistencias RGB LED (220Ω×3), IP 192.168.2.200:9393, Streamlit simulator, OpenMoji sin ZIP |
 | 2.0 | 2026-02-21 | Claude | Transformación a amigo familiar: identidad rediseñada (curioso, empático, explorador); eliminados usuarios/app → reemplazados por `people` + `face_embeddings` múltiples; sistema de ética y límites físicos; 5 primitivas ESP32 reales (`turn_right_deg`, `turn_left_deg`, `move_forward_cm`, `move_backward_cm`, `led_color`) + aliases gesturales; nuevos tags v2.0 (`[memory:]`, `[person_name:]`); REST reducido a 2 endpoints (`GET /api/health`, `GET /api/restore`); system prompt reescrito; BD reescrita (elimina `users`, `interactions`; añade `people`, `face_embeddings`); nuevos mensajes WS: `face_scan_mode`, `person_detected`, `battery_alert`, `person_registered`, `face_scan_actions`, `low_battery_alert` |
