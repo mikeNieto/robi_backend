@@ -178,6 +178,7 @@ Tu respuesta conversacional en prosa TTS-safe. Reglas obligatorias:
 - Escribe los números completamente en palabras: "quinientos" en lugar de "500".
 - Escribe los símbolos como palabras: "más", "por ciento", "euros".
 - Sin fórmulas, tablas, listas con viñetas, asteriscos ni notación especial.
+- Sin puntos suspensivos (el TTS los lee como puntos individuales); usa comas, punto y seguido u otras pausas naturales.
 - Prosa fluida y natural, como si hablaras directamente con alguien.
 - Para enumerar: "primero", "segundo", "y por último".
 - Habla siempre en el idioma que usa el usuario.
@@ -201,8 +202,9 @@ objetos y posición, personas y características, colores, texto legible, accion
 ocurren, ambiente y contexto general.
 • AUDIO: transcripción LITERAL y COMPLETA de todo lo dicho, palabra por palabra. \
 No menciones explícitamente el tono, emoción o estado de ánimo de la voz; en su lugar \
-refléjalos en la puntuación de la transcripción usando signos de admiración, puntos \
-suspensivos, mayúsculas de énfasis u otros recursos ortográficos naturales.
+refléjalos en la puntuación de la transcripción usando signos de admiración, comas \
+expresivas, mayúsculas de énfasis u otros recursos ortográficos naturales (NUNCA puntos \
+suspensivos: el TTS los lee como puntos separados).
 Usa el MISMO idioma del media. Este campo NO se leerá en voz alta."""
 
 
